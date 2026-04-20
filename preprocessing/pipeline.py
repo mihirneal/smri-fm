@@ -430,9 +430,9 @@ def run_synthseg(
     cpu_only: bool,
     timeout: float = 600,
 ) -> None:
-    # Use the venv's Python (with tf-nightly + CUDA 12.8 supporting Blackwell sm_120)
-    # to invoke mri_synthseg. FreeSurfer's bundled Python 3.8 ships TF 2.12 which
-    # cannot use Blackwell GPUs.
+    # Use the venv's Python to invoke mri_synthseg. FreeSurfer's bundled Python 3.8
+    # ships TF 2.12, while the container pins a newer GPU-capable TF stack that is
+    # compatible with this cluster's current NVIDIA driver/runtime.
     # Batch mode requires --i/--o/--vol/--qc to be .txt files listing one path per line.
     synthseg_script = Path(os.environ["FREESURFER_HOME"]) / "python" / "scripts" / "mri_synthseg"
 
@@ -458,10 +458,7 @@ def run_synthseg(
     ]
     if cpu_only:
         cmd.append("--cpu")
-    # TF_USE_LEGACY_KERAS=1 forces tf-keras (Keras 2); mri_synthseg breaks on Keras 3.
-    env = os.environ.copy()
-    env["TF_USE_LEGACY_KERAS"] = "1"
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=os.environ.copy())
     if result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode,
