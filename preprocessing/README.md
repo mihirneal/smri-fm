@@ -47,7 +47,7 @@ docker run --rm --gpus all \
   -v /path/to/bids:/data/input \
   -v /path/to/output:/data/output \
   -v /path/to/logs:/data/logs \
-  smri-fm-preproc --n_workers 48
+  smri-fm-preproc
 ```
 
 With SynthSeg:
@@ -58,8 +58,6 @@ docker run --rm --gpus all \
   -v /path/to/output:/data/output \
   -v /path/to/logs:/data/logs \
   -v /path/to/derivatives:/data/derivatives \
-  smri-fm-preproc --n_workers 48 --synthseg
+  smri-fm-preproc --synthseg
 ```
-
-The container defaults to `/data/input`, `/data/output`, and `/data/logs` — just mount your directories there. When `--synthseg` is passed, derivatives land in `/data/derivatives/synthseg` by default (sibling to `output`).
 
