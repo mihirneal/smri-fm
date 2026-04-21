@@ -615,6 +615,13 @@ def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
                 log.info("%s — SynthSeg done → %s", name, seg_path.name)
                 results.append({"file": name, "status": "success"})
 
+    except subprocess.CalledProcessError as e:
+        log.error("SynthSeg batch failed: %s", e, exc_info=True)
+        for label, text in (("stderr", e.stderr), ("stdout", e.output)):
+            if text := (text or "").strip():
+                log.error("SynthSeg %s:\n%s", label, text)
+        for name, *_ in pending:
+            results.append({"file": name, "status": "failed", "error": str(e)})
     except Exception as e:
         log.error("SynthSeg batch failed: %s", e, exc_info=True)
         for name, *_ in pending:
@@ -802,7 +809,12 @@ def main() -> None:
         log.error("Failed subjects: %s", [r["file"] for r in failed])
 
     if args.synthseg:
-        synthseg_input_files = [output_paths(f, bids_dir, out_dir)[0] for f in files]
+        processed = {r["file"] for r in results if r["status"] in ("success", "skipped")}
+        synthseg_input_files = [
+            output_paths(f, bids_dir, out_dir)[0]
+            for f in files
+            if str(f.relative_to(bids_dir)) in processed
+        ]
         if not synthseg_input_files:
             log.info("No preprocessed files found for SynthSeg.")
             sys.exit(1 if failed else 0)
