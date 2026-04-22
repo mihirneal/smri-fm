@@ -30,6 +30,9 @@ _version.py
 tmp
 .tmp*
 
-#AI assistants
+# AI assistants
 .claude/
 .codex
+
+# uv (too many conflicts)
+uv.lock
