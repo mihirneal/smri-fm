@@ -5,8 +5,8 @@ Preprocesses BIDS anatomical images and writes MNI-space derivatives. Supports T
 ## Pipeline
 
 1. Reorient to RAS
-2. Skull stripping with SynthStrip (FreeSurfer 7.4.1)
-3. Resample to 1 mm isotropic when needed (ANTs B-spline interpolation)
+2. Resample to 1 mm isotropic when needed (ANTs B-spline interpolation)
+3. Run SynthSeg on the 1 mm image
 4. Rigid registration to TemplateFlow `MNI152NLin2009cAsym` (ANTs)
 
 ## Outputs
@@ -21,9 +21,10 @@ For each input file the pipeline writes three derivatives (BIDS-compliant naming
 
 Brains smaller than the template field of view will be surrounded by zeros. Anatomy that falls outside the template boundary after rigid alignment is clipped.
 
-## Optional: SynthSeg
+## SynthSeg Derivatives
 
-Pass `--synthseg` to run FreeSurfer's `mri_synthseg` on preprocessed outputs, producing:
+Normal preprocessing runs also write SynthSeg derivatives under
+`preprocessing/data/processed/<dataset>/derivatives/synthseg/`:
 
 | File | Description |
 |---|---|
@@ -32,32 +33,38 @@ Pass `--synthseg` to run FreeSurfer's `mri_synthseg` on preprocessed outputs, pr
 | `*_desc-synthseg_volumes.tsv` | Volumetric measurements (GMV, WMV, sGMV, TCV, DK parcellation) |
 | `*_desc-synthseg_qc.tsv` | QC scores |
 
-## Docker
+Pass `--synthseg` to run only this SynthSeg stage on RAS-canonicalized raw inputs and skip MNI preprocessing outputs.
 
-Build from the repo root (build context must be the repo root, not this directory):
+## Local Runtime
+
+Use `uv` from the repo root:
 
 ```bash
-docker build -f preprocessing/Dockerfile -t smri-fm-preproc .
+uv sync --extra preprocessing
 ```
 
-Run against a BIDS directory:
+The pipeline expects dataset-scoped directories under `preprocessing/data/`:
+
+- raw inputs: `preprocessing/data/raw/<dataset>/`
+- preprocessed outputs: `preprocessing/data/processed/<dataset>/`
+- logs: `preprocessing/data/logs/<dataset>/`
+- SynthSeg outputs: `preprocessing/data/processed/<dataset>/derivatives/synthseg/`
+
+Run preprocessing:
 
 ```bash
-docker run --rm --gpus all \
-  -v /path/to/bids:/data/input \
-  -v /path/to/output:/data/output \
-  -v /path/to/logs:/data/logs \
-  smri-fm-preproc
+uv run preprocessing/pipeline.py --dataset <dataset>
 ```
 
-With SynthSeg:
+SynthSeg-only mode:
 
 ```bash
-docker run --rm --gpus all \
-  -v /path/to/bids:/data/input \
-  -v /path/to/output:/data/output \
-  -v /path/to/logs:/data/logs \
-  -v /path/to/derivatives:/data/derivatives \
-  smri-fm-preproc --synthseg
+uv run preprocessing/pipeline.py --dataset <dataset> --synthseg
+```
+
+The default SynthSeg backend is:
+
+```bash
+uvx --python 3.11 --from 'git+https://github.com/MedARC-AI/SynthSeg.git' SynthSeg
 ```
 
