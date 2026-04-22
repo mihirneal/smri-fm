@@ -24,6 +24,8 @@ _version.py
 
 # Local data directories
 **/data
+/DLBS/
+/BrainIAC/
 
 # Local scratch/tmp
 .scratch
