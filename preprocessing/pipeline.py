@@ -4,6 +4,7 @@ import json
 import logging
 import multiprocessing
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,10 @@ import numpy as np
 log = logging.getLogger("preproc")
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+DATA_ROOT = Path(__file__).resolve().parent / "data"
+DEFAULT_SYNTHSEG_CMD = (
+    "uvx --python 3.11 --from 'git+https://github.com/MedARC-AI/SynthSeg.git' SynthSeg"
+)
 
 
 def setup_logging(log_file: Path) -> None:
@@ -234,39 +239,11 @@ def ants_to_nib(ants_img: ants.ANTsImage) -> nib.Nifti1Image:
     return img
 
 
-def synthstrip(img: nib.Nifti1Image) -> tuple[nib.Nifti1Image, nib.Nifti1Image]:
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        nib.save(img, tmp / "input.nii.gz")
-        subprocess.run(
-            [
-                "mri_synthstrip",
-                "-i",
-                str(tmp / "input.nii.gz"),
-                "-o",
-                str(tmp / "brain.nii.gz"),
-                "-m",
-                str(tmp / "mask.nii.gz"),
-            ],
-            check=True,
-        )
-        brain = nib.load(tmp / "brain.nii.gz")
-        mask = nib.load(tmp / "mask.nii.gz")
-        brain = nib.Nifti1Image(brain.get_fdata(), brain.affine, brain.header)
-        mask = nib.Nifti1Image(mask.get_fdata(), mask.affine, mask.header)
-    return brain, mask
 
-
-def resample_to_1mm(
-    img: nib.Nifti1Image, mask: nib.Nifti1Image
-) -> tuple[nib.Nifti1Image, nib.Nifti1Image]:
-    img_r = ants_to_nib(
+def resample_to_1mm(img: nib.Nifti1Image) -> nib.Nifti1Image:
+    return ants_to_nib(
         ants.resample_image(nib_to_ants(img), (1, 1, 1), use_voxels=False, interp_type=4)
     )
-    mask_r = ants_to_nib(
-        ants.resample_image(nib_to_ants(mask), (1, 1, 1), use_voxels=False, interp_type=1)
-    )
-    return img_r, mask_r
 
 
 def rigid_register_to_template(
@@ -327,54 +304,6 @@ def apply_mask_and_clip(
     return brain, bin_mask
 
 
-def process_file(args: tuple[Path, Path, Path, Path]) -> dict:
-    input_path, bids_dir, out_dir, template_brain_path = args
-    name = str(input_path.relative_to(bids_dir))
-    preproc_path, mask_path, xfm_path = output_paths(input_path, bids_dir, out_dir)
-
-    if preproc_path.exists() and mask_path.exists() and xfm_path.exists():
-        log.info("%s — already processed, skipping", name)
-        return {"file": name, "status": "skipped"}
-
-    log.info("%s — starting", name)
-    try:
-        img = nib.load(input_path)
-
-        log.info("%s — reorienting to RAS", name)
-        img = reorient_to_ras(img)
-
-        log.info("%s — SynthStrip skull stripping", name)
-        brain, mask = synthstrip(img)
-
-        zooms = brain.header.get_zooms()[:3]
-        if not np.allclose(zooms, 1.0, atol=1e-3):
-            log.info("%s — resampling to 1 mm isotropic", name)
-            brain, mask = resample_to_1mm(brain, mask)
-        else:
-            log.info("%s — already 1 mm isotropic, skipping resample", name)
-
-        # Applied twice: B-spline interpolation (resampling and registration) can produce
-        # small negative values at sharp brain-edge boundaries.
-        brain, mask = apply_mask_and_clip(brain, mask)
-
-        log.info("%s — rigid registration to %s", name, TEMPLATE_SPACE)
-        brain, mask = rigid_register_to_template(brain, mask, template_brain_path, xfm_path)
-
-        log.info("%s — applying transformed mask and clipping overshoot", name)
-        brain, mask = apply_mask_and_clip(brain, mask)
-
-        nib.save(brain, preproc_path)
-        nib.save(mask, mask_path)
-        log.info("%s — done → %s", name, preproc_path.name)
-        return {"file": name, "status": "success"}
-    except Exception as e:
-        log.error("%s — failed: %s", name, e, exc_info=True)
-        return {"file": name, "status": "failed", "error": str(e)}
-
-
-# ── SynthSeg helpers ──────────────────────────────────────────────────────────
-
-
 def _detect_gpu_count() -> int:
     try:
         result = subprocess.run(
@@ -384,6 +313,32 @@ def _detect_gpu_count() -> int:
         return len(result.stdout.strip().splitlines())
     except (subprocess.SubprocessError, FileNotFoundError):
         return 0
+
+
+def _parse_synthseg_cmd(command: str) -> list[str]:
+    return shlex.split(command)
+
+
+def resolve_run_dirs(
+    dataset: str | None,
+    bids_dir: Path | None,
+    out_dir: Path | None,
+    log_dir: Path | None,
+    synthseg_dir: Path | None,
+) -> tuple[str, Path, Path, Path, Path]:
+    if dataset:
+        dataset_name = dataset
+    elif bids_dir is not None:
+        dataset_name = bids_dir.resolve().name
+    else:
+        raise ValueError("Provide --dataset or --bids so default data directories can be resolved.")
+    resolved_bids = (bids_dir or DATA_ROOT / "raw" / dataset_name).resolve()
+    resolved_output = (out_dir or DATA_ROOT / "processed" / dataset_name).resolve()
+    resolved_logs = (log_dir or DATA_ROOT / "logs" / dataset_name).resolve()
+    resolved_synthseg = (
+        synthseg_dir or DATA_ROOT / "processed" / dataset_name / "derivatives" / "synthseg"
+    ).resolve()
+    return dataset_name, resolved_bids, resolved_output, resolved_logs, resolved_synthseg
 
 
 def write_tsv(rows: list[dict], path: Path) -> None:
@@ -421,21 +376,32 @@ def synthseg_output_paths(
     return seg, dseg, volumes, qc
 
 
+def staged_input_path(input_path: Path, bids_dir: Path, stage_dir: Path) -> Path:
+    rel = input_path.relative_to(bids_dir)
+    stem = input_path.name.replace(".nii.gz", "")
+    out = stage_dir / rel.parent / f"{stem}_desc-synthseg-input.nii.gz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def synthseg_brain_mask(seg: nib.Nifti1Image) -> nib.Nifti1Image:
+    mask_data = (np.asarray(seg.dataobj) > 0).astype(np.uint8)
+    mask_header = seg.header.copy()
+    mask_header.set_data_dtype(np.uint8)
+    return nib.Nifti1Image(mask_data, seg.affine, mask_header)
+
+
 def run_synthseg(
     input_paths: list[Path],
     seg_paths: list[Path],
     vol_csvs: list[Path],
     qc_csvs: list[Path],
+    synthseg_cmd: str,
     threads: int,
     cpu_only: bool,
     timeout: float = 600,
 ) -> None:
-    # Use the venv's Python to invoke mri_synthseg. FreeSurfer's bundled Python 3.8
-    # ships TF 2.12, while the container pins a newer GPU-capable TF stack that is
-    # compatible with this cluster's current NVIDIA driver/runtime.
     # Batch mode requires --i/--o/--vol/--qc to be .txt files listing one path per line.
-    synthseg_script = Path(os.environ["FREESURFER_HOME"]) / "python" / "scripts" / "mri_synthseg"
-
     tmp_dir = vol_csvs[0].parent
     input_txt = tmp_dir / "inputs.txt"
     output_txt = tmp_dir / "outputs.txt"
@@ -446,8 +412,7 @@ def run_synthseg(
     vol_txt.write_text("\n".join(str(p) for p in vol_csvs) + "\n")
     qc_txt.write_text("\n".join(str(p) for p in qc_csvs) + "\n")
 
-    cmd = [
-        "/opt/venv/bin/python", str(synthseg_script),
+    cmd = _parse_synthseg_cmd(synthseg_cmd) + [
         "--i", str(input_txt),
         "--o", str(output_txt),
         "--parc",
@@ -548,12 +513,70 @@ def _synthseg_pool_init(log_file: Path, n_gpus: int) -> None:
     setup_logging(log_file)
 
 
+def stage_input_file(args: tuple[Path, Path, Path]) -> dict:
+    input_path, bids_dir, stage_dir = args
+    name = str(input_path.relative_to(bids_dir))
+    try:
+        staged_path = staged_input_path(input_path, bids_dir, stage_dir)
+        log.info("%s — staging for SynthSeg: reorienting to RAS", name)
+        img = reorient_to_ras(nib.load(input_path))
+        if not np.allclose(img.header.get_zooms()[:3], 1.0, atol=1e-3):
+            log.info("%s — staging for SynthSeg: resampling to 1 mm isotropic", name)
+            img = resample_to_1mm(img)
+        else:
+            log.info("%s — staging for SynthSeg: already 1 mm isotropic, skipping resample", name)
+        nib.save(img, staged_path)
+        log.info("%s — staging for SynthSeg done → %s", name, staged_path.name)
+        return {"file": name, "status": "success", "staged_path": str(staged_path)}
+    except Exception as e:
+        log.error("%s — staging failed: %s", name, e, exc_info=True)
+        return {"file": name, "status": "failed", "error": str(e)}
+
+
+def process_file(args: tuple[Path, Path, Path, Path, Path, Path]) -> dict:
+    input_path, staged_path, bids_dir, out_dir, template_brain_path, synthseg_dir = args
+    name = str(input_path.relative_to(bids_dir))
+    preproc_path, mask_path, xfm_path = output_paths(input_path, bids_dir, out_dir)
+
+    if preproc_path.exists() and mask_path.exists() and xfm_path.exists():
+        log.info("%s — already processed, skipping", name)
+        return {"file": name, "status": "skipped"}
+
+    log.info("%s — starting", name)
+    try:
+        img = nib.load(staged_path)
+
+        seg_path, _, _, _ = synthseg_output_paths(input_path, bids_dir, synthseg_dir)
+        if not seg_path.exists():
+            raise FileNotFoundError(f"SynthSeg output not found: {seg_path}")
+        seg = nib.load(seg_path)
+        mask = synthseg_brain_mask(seg)
+
+        # Applied twice: B-spline interpolation (resampling and registration) can produce
+        # small negative values at sharp brain-edge boundaries.
+        brain, mask = apply_mask_and_clip(img, mask)
+
+        log.info("%s — rigid registration to %s", name, TEMPLATE_SPACE)
+        brain, mask = rigid_register_to_template(brain, mask, template_brain_path, xfm_path)
+
+        log.info("%s — applying transformed mask and clipping overshoot", name)
+        brain, mask = apply_mask_and_clip(brain, mask)
+
+        nib.save(brain, preproc_path)
+        nib.save(mask, mask_path)
+        log.info("%s — done → %s", name, preproc_path.name)
+        return {"file": name, "status": "success"}
+    except Exception as e:
+        log.error("%s — failed: %s", name, e, exc_info=True)
+        return {"file": name, "status": "failed", "error": str(e)}
+
+
 def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
     results: list[dict] = []
     pending: list[tuple] = []
 
     for task in tasks:
-        input_path, bids_dir, synthseg_dir, synthseg_threads, cpu_only = task
+        input_path, staged_path, bids_dir, synthseg_dir, synthseg_cmd, synthseg_threads, cpu_only = task
         name = str(input_path.relative_to(bids_dir))
         seg_path, dseg_tsv, volumes_tsv, qc_tsv = synthseg_output_paths(
             input_path, bids_dir, synthseg_dir
@@ -571,10 +594,12 @@ def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
                 (
                     name,
                     input_path,
+                    staged_path,
                     seg_path,
                     dseg_tsv,
                     volumes_tsv,
                     qc_tsv,
+                    synthseg_cmd,
                     synthseg_threads,
                     cpu_only,
                 )
@@ -583,29 +608,29 @@ def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
     if not pending:
         return results
 
-    _, _, _, _, _, _, synthseg_threads, cpu_only = pending[0]
+    _, _, _, _, _, _, _, synthseg_cmd, synthseg_threads, cpu_only = pending[0]
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             vol_csvs = [tmp / f"vol_{i}.csv" for i in range(len(pending))]
             qc_csvs = [tmp / f"qc_{i}.csv" for i in range(len(pending))]
+            staged_input_paths = [staged_path for _, _, staged_path, *_ in pending]
+            seg_paths = [seg_path for _, _, _, seg_path, *_ in pending]
 
-            input_paths = [input_path for _, input_path, *_ in pending]
-            seg_paths = [seg_path for _, _, seg_path, *_ in pending]
-
-            log.info("SynthSeg batch: running mri_synthseg on %d scan(s)", len(pending))
+            log.info("SynthSeg batch: running backend on %d scan(s)", len(pending))
             run_synthseg(
-                input_paths,
+                staged_input_paths,
                 seg_paths,
                 vol_csvs,
                 qc_csvs,
+                synthseg_cmd,
                 synthseg_threads,
                 cpu_only,
                 timeout=600 * len(pending),
             )
 
-            for i, (name, _, seg_path, dseg_tsv, volumes_tsv, qc_tsv, *_) in enumerate(pending):
+            for i, (name, _, _, seg_path, dseg_tsv, volumes_tsv, qc_tsv, *_) in enumerate(pending):
                 log.info("%s — parsing volumes and writing outputs", name)
                 vol_rows = parse_synthseg_volumes(vol_csvs[i])
                 qc_rows = parse_synthseg_qc(qc_csvs[i])
@@ -635,8 +660,10 @@ def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
 
 def _run_synthseg_stage(
     files: list[Path],
+    staged_files: list[Path],
     base_dir: Path,
     synthseg_dir: Path,
+    synthseg_cmd: str,
     synthseg_workers: int,
     n_gpus: int,
     synthseg_threads: int,
@@ -644,7 +671,10 @@ def _run_synthseg_stage(
     log_file: Path,
     log_dir: Path,
 ) -> None:
-    synthseg_file_tasks = [(f, base_dir, synthseg_dir, synthseg_threads, cpu_only) for f in files]
+    synthseg_file_tasks = [
+        (f, staged_f, base_dir, synthseg_dir, synthseg_cmd, synthseg_threads, cpu_only)
+        for f, staged_f in zip(files, staged_files, strict=True)
+    ]
     synthseg_batches = [b for b in _partition(synthseg_file_tasks, synthseg_workers) if b]
 
     log.info(
@@ -701,38 +731,108 @@ def _partition(items: list, n: int):
         i += size
 
 
+def _stage_inputs(
+    files: list[Path],
+    bids_dir: Path,
+    stage_dir: Path,
+    n_workers: int,
+    itk_threads: int,
+    log_file: Path,
+    log_dir: Path,
+) -> list[Path]:
+    log.info("Staging %d file(s) for SynthSeg input", len(files))
+    stage_tasks = [(f, bids_dir, stage_dir) for f in files]
+    if n_workers > 1:
+        os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(itk_threads)
+        with multiprocessing.Pool(
+            n_workers, initializer=_pool_init, initargs=(log_file, itk_threads)
+        ) as pool:
+            stage_results = pool.map(stage_input_file, stage_tasks)
+    else:
+        stage_results = [stage_input_file(task) for task in stage_tasks]
+
+    staged_succeeded = [r for r in stage_results if r["status"] == "success"]
+    staged_failed = [r for r in stage_results if r["status"] == "failed"]
+    staging_status = {
+        "timestamp": datetime.now().isoformat(),
+        "total": len(stage_results),
+        "successful": len(staged_succeeded),
+        "failed": len(staged_failed),
+        "skipped": 0,
+        "subjects": stage_results,
+    }
+    staging_status_file = log_dir / "staging_status.json"
+    with open(staging_status_file, "w") as f:
+        json.dump(staging_status, f, indent=2)
+    log.info(
+        "Staging — %d succeeded, %d failed. Status: %s",
+        len(staged_succeeded),
+        len(staged_failed),
+        staging_status_file,
+    )
+    if staged_failed:
+        log.error("Staging failed subjects: %s", [r["file"] for r in staged_failed])
+    successful = [
+        (files[i], Path(r["staged_path"]))
+        for i, r in enumerate(stage_results)
+        if r["status"] == "success"
+    ]
+    return [f for f, _ in successful], [s for _, s in successful]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Anat preprocessing pipeline")
-    parser.add_argument("--bids", default=Path("/data/input"), type=Path)
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        type=str,
+        help="Dataset name under preprocessing/data/{raw,processed,logs}/.",
+    )
+    parser.add_argument(
+        "--bids",
+        default=None,
+        type=Path,
+        help="BIDS input directory (defaults to preprocessing/data/raw/<dataset>).",
+    )
     parser.add_argument("--subject", default=None, type=str)
-    parser.add_argument("--output", default=Path("/data/output"), type=Path)
-    parser.add_argument("--log_dir", default=Path("/data/logs"), type=Path)
-    parser.add_argument("--n_workers", default=os.cpu_count() // 2, type=int)
+    parser.add_argument(
+        "--output",
+        default=None,
+        type=Path,
+        help="Preprocessed output directory (defaults to preprocessing/data/processed/<dataset>).",
+    )
+    parser.add_argument(
+        "--log_dir",
+        default=None,
+        type=Path,
+        help="Log directory (defaults to preprocessing/data/logs/<dataset>).",
+    )
+    parser.add_argument("--n_workers", default=max(1, (os.cpu_count() or 2) // 2), type=int)
     parser.add_argument("--itk_threads", default=2, type=int)
     parser.add_argument("--template_brain", default=None, type=Path)
     parser.add_argument(
         "--synthseg",
         action="store_true",
         default=False,
-        help="After preprocessing, run SynthSeg on the preprocessed outputs.",
+        help="Run only SynthSeg on RAS-canonicalized raw inputs and skip preprocessing.",
     )
     parser.add_argument(
         "--cpu",
         action="store_true",
         default=False,
-        help="Force SynthSeg to run on CPU (passes --cpu to mri_synthseg).",
+        help="Force SynthSeg to run on CPU (passes --cpu to the backend).",
     )
     parser.add_argument(
         "--synthseg_threads",
         default=8,
         type=int,
-        help="CPU threads per mri_synthseg call (default: 8).",
+        help="Requested CPU threads per SynthSeg call (ignored by backends without --threads).",
     )
     parser.add_argument(
         "--synthseg_output",
         default=None,
         type=Path,
-        help="Output directory for SynthSeg derivatives (default: <output>/../derivatives/synthseg).",
+        help="Output directory for SynthSeg derivatives (defaults to preprocessing/data/processed/<dataset>/derivatives/synthseg).",
     )
     parser.add_argument(
         "--synthseg_workers",
@@ -740,18 +840,30 @@ def main() -> None:
         type=int,
         help="Worker pool size for SynthSeg. Defaults to GPU count (or n_workers on CPU).",
     )
+    parser.add_argument(
+        "--synthseg_cmd",
+        default=DEFAULT_SYNTHSEG_CMD,
+        type=str,
+        help="Command used to launch SynthSeg.",
+    )
     args = parser.parse_args()
 
-    bids_dir = args.bids.resolve()
-    out_dir = args.output.resolve()
-    log_dir = args.log_dir.resolve()
+    try:
+        dataset_name, bids_dir, out_dir, log_dir, synthseg_dir = resolve_run_dirs(
+            args.dataset,
+            args.bids,
+            args.output,
+            args.log_dir,
+            args.synthseg_output,
+        )
+    except ValueError as e:
+        parser.error(str(e))
     template_brain = (args.template_brain or _get_default_template_brain()).resolve()
-    synthseg_dir = (args.synthseg_output or args.output.parent / "derivatives" / "synthseg").resolve()
 
-    for d in (bids_dir, out_dir, log_dir):
+    if not bids_dir.exists():
+        raise FileNotFoundError(f"BIDS input directory not found: {bids_dir}")
+    for d in (out_dir, log_dir, synthseg_dir):
         d.mkdir(parents=True, exist_ok=True)
-    if args.synthseg:
-        synthseg_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine SynthSeg worker count: one worker per GPU on a multi-GPU node
     # so each worker is pinned to its own GPU (see _synthseg_pool_init).
@@ -763,6 +875,12 @@ def main() -> None:
 
     log_file = log_dir / "run.log"
     setup_logging(log_file)
+    log.info("Dataset: %s", dataset_name)
+    log.info("BIDS input: %s", bids_dir)
+    log.info("Preprocessed output: %s", out_dir)
+    log.info("Log directory: %s", log_dir)
+    log.info("SynthSeg output: %s", synthseg_dir)
+    log.info("SynthSeg command: %s", DEFAULT_SYNTHSEG_CMD)
 
     if not template_brain.exists():
         raise FileNotFoundError(f"Template brain not found: {template_brain}")
@@ -773,16 +891,52 @@ def main() -> None:
         return
 
     log.info("Found %d anat file(s). Workers: %d", len(files), args.n_workers)
+    with tempfile.TemporaryDirectory(prefix="preproc-stage-") as tmpdir:
+        stage_dir = Path(tmpdir)
+        files, staged_files = _stage_inputs(
+            files,
+            bids_dir,
+            stage_dir,
+            args.n_workers,
+            args.itk_threads,
+            log_file,
+            log_dir,
+        )
+        _run_synthseg_stage(
+            files,
+            staged_files,
+            bids_dir,
+            synthseg_dir,
+            DEFAULT_SYNTHSEG_CMD,
+            synthseg_workers,
+            n_gpus,
+            args.synthseg_threads,
+            args.cpu,
+            log_file,
+            log_dir,
+        )
+        if args.synthseg:
+            return
 
-    tasks = [(f, bids_dir, out_dir, template_brain) for f in files]
-    if args.n_workers > 1:
-        os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(args.itk_threads)
-        with multiprocessing.Pool(
-            args.n_workers, initializer=_pool_init, initargs=(log_file, args.itk_threads)
-        ) as pool:
-            results = pool.map(process_file, tasks)
-    else:
-        results = [process_file(task) for task in tasks]
+        tasks = [
+            (
+                f,
+                staged_f,
+                bids_dir,
+                out_dir,
+                template_brain,
+                synthseg_dir,
+            )
+            for f, staged_f in zip(files, staged_files, strict=True)
+        ]
+        if args.n_workers > 1:
+            os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(args.itk_threads)
+            with multiprocessing.Pool(
+                args.n_workers, initializer=_pool_init, initargs=(log_file, args.itk_threads)
+            ) as pool:
+                results = pool.map(process_file, tasks)
+        else:
+            results = [process_file(task) for task in tasks]
 
     succeeded = [r for r in results if r["status"] == "success"]
     failed = [r for r in results if r["status"] == "failed"]
@@ -807,28 +961,6 @@ def main() -> None:
     )
     if failed:
         log.error("Failed subjects: %s", [r["file"] for r in failed])
-
-    if args.synthseg:
-        processed = {r["file"] for r in results if r["status"] in ("success", "skipped")}
-        synthseg_input_files = [
-            output_paths(f, bids_dir, out_dir)[0]
-            for f in files
-            if str(f.relative_to(bids_dir)) in processed
-        ]
-        if not synthseg_input_files:
-            log.info("No preprocessed files found for SynthSeg.")
-            sys.exit(1 if failed else 0)
-        _run_synthseg_stage(
-            synthseg_input_files,
-            out_dir,
-            synthseg_dir,
-            synthseg_workers,
-            n_gpus,
-            args.synthseg_threads,
-            args.cpu,
-            log_file,
-            log_dir,
-        )
 
     if failed:
         sys.exit(1)
