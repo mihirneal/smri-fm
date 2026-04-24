@@ -1,38 +1,34 @@
 # MRI Preprocessing
 
-Preprocesses BIDS anatomical images and writes MNI-space derivatives. Supports T1w, T2w, and FLAIR inputs.
+Processes anatomical images into MNI-space outputs. Supports T1w, T2w, and FLAIR inputs.
 
 ## Pipeline
 
-1. Reorient to RAS
-2. Resample to 1 mm isotropic when needed (ANTs B-spline interpolation)
-3. Run SynthSeg on the 1 mm image
-4. Rigid registration to TemplateFlow `MNI152NLin2009cAsym` (ANTs)
+1. Rigid registration to TemplateFlow `MNI152NLin2009cAsym` (ANTs)
+2. Run SynthSeg on the processed image
+3. Save a binary brain mask from the SynthSeg segmentation (`dseg > 0`)
 
 ## Outputs
 
-For each input file the pipeline writes three derivatives (BIDS-compliant naming):
+For each input file the pipeline writes:
 
 | File | Description |
 |---|---|
-| `*_space-MNI152NLin2009cAsym_desc-preproc_{suffix}.nii.gz` | MNI-space preprocessed image |
-| `*_space-MNI152NLin2009cAsym_desc-brain_mask_{suffix}.nii.gz` | MNI-space brain mask |
-| `*_from-native_to-MNI152NLin2009cAsym_mode-image_desc-{suffix}_xfm.mat` | Rigid transform to MNI |
+| `<input>/processed/*_space-MNI152NLin2009cAsym_desc-processed.nii.gz` | MNI-space processed image |
+| `<input>/derivatives/masks/*_space-MNI152NLin2009cAsym_desc-brain_mask.nii.gz` | Binary brain mask for skull stripping |
+| `<input>/derivatives/transforms/*_from-native_to-MNI152NLin2009cAsym_mode-image_xfm.mat` | Rigid transform to MNI |
 
 Brains smaller than the template field of view will be surrounded by zeros. Anatomy that falls outside the template boundary after rigid alignment is clipped.
 
 ## SynthSeg Derivatives
 
-Normal preprocessing runs also write SynthSeg derivatives under
-`preprocessing/data/processed/<dataset>/derivatives/synthseg/`:
+The full pipeline also writes SynthSeg derivatives under `<input>/derivatives/synthseg/`:
 
 | File | Description |
 |---|---|
 | `*_desc-synthseg_dseg.nii.gz` | Tissue segmentation |
 | `*_volumes.csv` | Raw SynthSeg volumetric measurements |
 | `*_qc.csv` | Raw SynthSeg QC scores |
-
-Pass `--synthseg` to run only this SynthSeg stage on RAS-canonicalized raw inputs and skip MNI preprocessing outputs.
 
 ## Local Runtime
 
@@ -42,23 +38,17 @@ Use `uv` from the repo root:
 uv sync --extra preprocessing
 ```
 
-The pipeline expects dataset-scoped directories under `preprocessing/data/`:
+The pipeline expects an input directory with an `images/` subdirectory:
 
-- raw inputs: `preprocessing/data/raw/<dataset>/`
-- preprocessed outputs: `preprocessing/data/processed/<dataset>/`
-- logs: `preprocessing/data/logs/<dataset>/`
-- SynthSeg outputs: `preprocessing/data/processed/<dataset>/derivatives/synthseg/`
+- raw inputs: `<input>/images/`
+- processed outputs: `<input>/processed/`
+- logs: `<input>/logs/`
+- derivatives: `<input>/derivatives/`
 
-Run preprocessing:
-
-```bash
-uv run preprocessing/pipeline.py --dataset <dataset>
-```
-
-SynthSeg-only mode:
+Run the full pipeline:
 
 ```bash
-uv run preprocessing/pipeline.py --dataset <dataset> --synthseg
+uv run --extra preprocessing preprocessing/pipeline.py --input <input>
 ```
 
 The default SynthSeg backend is:

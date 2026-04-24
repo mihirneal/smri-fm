@@ -10,8 +10,9 @@ from pathlib import Path
 
 import ants
 import nibabel as nib
+import numpy as np
 
-log = logging.getLogger("preproc")
+log = logging.getLogger("preprocess")
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 DEFAULT_SYNTHSEG_CMD = (
@@ -21,48 +22,34 @@ TEMPLATE_SPACE = "MNI152NLin2009cAsym"
 
 
 def setup_logging(log_file: Path) -> None:
-    logger = logging.getLogger("preproc")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    fh = logging.FileHandler(log_file)
-    fh.setFormatter(logging.Formatter(LOG_FORMAT))
-    sh = logging.StreamHandler()
-    sh.setFormatter(logging.Formatter(LOG_FORMAT))
-    logger.addHandler(fh)
-    logger.addHandler(sh)
+    logging.basicConfig(
+        level=logging.INFO,
+        format=LOG_FORMAT,
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+        force=True,
+    )
 
 
-def _bids_entities(stem: str) -> dict[str, str]:
-    entities = {}
-    for part in stem.split("_"):
-        if "-" in part:
-            key, val = part.split("-", 1)
-            entities[key] = val
-    return entities
+def scan_stem(input_path: Path) -> str:
+    return input_path.name.removesuffix(".nii.gz")
 
 
-def preproc_output_path(input_path: Path, input_dir: Path) -> Path:
-    stem = input_path.name.replace(".nii.gz", "")
-    d = input_dir / "preprocessed"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / f"{stem}_space-{TEMPLATE_SPACE}_desc-preproc.nii.gz"
-
-
-def matrix_output_path(input_path: Path, input_dir: Path) -> Path:
-    stem = input_path.name.replace(".nii.gz", "")
-    d = input_dir / "derivatives" / "matrices"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / f"{stem}_from-native_to-{TEMPLATE_SPACE}_mode-image_xfm.mat"
+def output_paths(input_path: Path, input_dir: Path) -> tuple[Path, Path, Path]:
+    stem = input_path.name.removesuffix(".nii.gz")
+    processed_dir = input_dir / "processed"
+    mask_dir = input_dir / "derivatives" / "masks"
+    xfm_dir = input_dir / "derivatives" / "transforms"
+    for d in (processed_dir, mask_dir, xfm_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    processed = processed_dir / f"{stem}_space-{TEMPLATE_SPACE}_desc-processed.nii.gz"
+    mask = mask_dir / f"{stem}_space-{TEMPLATE_SPACE}_desc-brain_mask.nii.gz"
+    xfm = xfm_dir / f"{stem}_from-native_to-{TEMPLATE_SPACE}_mode-image_xfm.mat"
+    return processed, mask, xfm
 
 
 def synthseg_output_paths(input_path: Path, input_dir: Path) -> tuple[Path, Path, Path]:
-    stem = input_path.name.replace(".nii.gz", "")
-    entities = _bids_entities(stem)
-    sub = f"sub-{entities['sub']}" if "sub" in entities else "unknown"
-    ses = f"ses-{entities['ses']}" if "ses" in entities else None
-    d = input_dir / "derivatives" / "synthseg" / sub
-    if ses:
-        d = d / ses
+    stem = scan_stem(input_path)
+    d = input_dir / "derivatives" / "synthseg"
     d.mkdir(parents=True, exist_ok=True)
     seg = d / f"{stem}_desc-synthseg_dseg.nii.gz"
     vol = d / f"{stem}_volumes.csv"
@@ -70,7 +57,7 @@ def synthseg_output_paths(input_path: Path, input_dir: Path) -> tuple[Path, Path
     return seg, vol, qc
 
 
-def nib_to_ants(img: nib.Nifti1Image) -> ants.ANTsImage:
+def nib_to_ants(img: nib.Nifti1Image):
     with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
         nib.save(img, tmp.name)
         ants_img = ants.image_read(tmp.name)
@@ -78,13 +65,21 @@ def nib_to_ants(img: nib.Nifti1Image) -> ants.ANTsImage:
     return ants_img
 
 
-def ants_to_nib(ants_img: ants.ANTsImage) -> nib.Nifti1Image:
+def ants_to_nib(ants_img) -> nib.Nifti1Image:
     with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
         ants.image_write(ants_img, tmp.name)
         img = nib.load(tmp.name)
         img = nib.Nifti1Image(img.get_fdata(), img.affine, img.header)
     Path(tmp.name).unlink(missing_ok=True)
     return img
+
+
+def save_brain_mask_from_segmentation(seg_path: Path, mask_path: Path) -> None:
+    seg_img = nib.load(seg_path)
+    mask = (np.asanyarray(seg_img.dataobj) > 0).astype(np.uint8)
+    header = seg_img.header.copy()
+    header.set_data_dtype(np.uint8)
+    nib.save(nib.Nifti1Image(mask, seg_img.affine, header), mask_path)
 
 
 def rigid_register_to_template(
@@ -128,10 +123,6 @@ def _default_template_brain() -> Path:
     )))
 
 
-def _parse_synthseg_cmd(command: str) -> list[str]:
-    return shlex.split(command)
-
-
 def run_synthseg(
     input_paths: list[Path],
     seg_paths: list[Path],
@@ -153,7 +144,7 @@ def run_synthseg(
         vol_txt.write_text("\n".join(str(p) for p in vol_paths) + "\n")
         qc_txt.write_text("\n".join(str(p) for p in qc_paths) + "\n")
 
-        cmd = _parse_synthseg_cmd(synthseg_cmd) + [
+        cmd = shlex.split(synthseg_cmd) + [
             "--i", str(input_txt),
             "--o", str(output_txt),
             "--vol", str(vol_txt),
@@ -164,90 +155,85 @@ def run_synthseg(
         ]
         if cpu_only:
             cmd.append("--cpu")
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=os.environ.copy()
-        )
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(
-            result.returncode, cmd, output=result.stdout, stderr=result.stderr,
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=os.environ.copy(),
+            check=True,
         )
 
 
-def process_file(args: tuple) -> dict:
-    input_path, input_dir, template_brain_path = args
+def process_file(input_path: Path, input_dir: Path, template_brain_path: Path) -> bool:
     name = str(input_path.relative_to(input_dir))
-    preproc_path = preproc_output_path(input_path, input_dir)
-    xfm_path = matrix_output_path(input_path, input_dir)
+    processed_path, _, xfm_path = output_paths(input_path, input_dir)
 
-    if preproc_path.exists() and xfm_path.exists():
+    if processed_path.exists() and xfm_path.exists():
         log.info("%s — already registered, skipping", name)
-        return {"file": name, "status": "skipped"}
+        return True
 
     log.info("%s — rigid registration to %s", name, TEMPLATE_SPACE)
     try:
         img = nib.load(input_path)
         registered = rigid_register_to_template(img, template_brain_path, xfm_path)
-        nib.save(registered, preproc_path)
-        log.info("%s — done → %s", name, preproc_path.name)
-        return {"file": name, "status": "success"}
+        nib.save(registered, processed_path)
+        log.info("%s — done → %s", name, processed_path.name)
+        return True
     except Exception as e:
         log.error("%s — failed: %s", name, e, exc_info=True)
-        return {"file": name, "status": "failed", "error": str(e)}
+        return False
 
 
-def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
-    results: list[dict] = []
+def process_synthseg_batch(
+    tasks: list[tuple[Path, Path, Path, Path, Path, Path]],
+    synthseg_cmd: str,
+    threads: int,
+    cpu_only: bool,
+) -> list[str]:
+    failed: list[str] = []
     pending: list[tuple] = []
 
-    for task in tasks:
-        orig_path, preproc_path, input_dir, synthseg_cmd, synthseg_threads, cpu_only = task
-        name = str(orig_path.relative_to(input_dir))
-        seg_path, vol_path, qc_path = synthseg_output_paths(orig_path, input_dir)
+    for orig_path, processed_path, seg_path, vol_path, qc_path, mask_path in tasks:
+        name = orig_path.name
         if seg_path.exists() and vol_path.exists() and qc_path.exists():
             log.info("%s — SynthSeg already done, skipping", name)
-            results.append({"file": name, "status": "skipped"})
+            if not mask_path.exists():
+                try:
+                    save_brain_mask_from_segmentation(seg_path, mask_path)
+                    log.info("%s — brain mask done → %s", name, mask_path.name)
+                except Exception as e:
+                    log.error("%s — brain mask failed: %s", name, e, exc_info=True)
+                    failed.append(name)
         else:
-            pending.append(
-                (
-                    name,
-                    orig_path,
-                    preproc_path,
-                    seg_path,
-                    vol_path,
-                    qc_path,
-                    synthseg_cmd,
-                    synthseg_threads,
-                    cpu_only,
-                )
-            )
+            pending.append((name, processed_path, seg_path, vol_path, qc_path, mask_path))
 
     if not pending:
-        return results
-
-    _, _, _, _, _, _, synthseg_cmd, synthseg_threads, cpu_only = pending[0]
+        return failed
 
     try:
-        preproc_paths = [preproc_path for _, _, preproc_path, *_ in pending]
-        seg_paths = [seg_path for _, _, _, seg_path, *_ in pending]
-        vol_paths = [vol_path for _, _, _, _, vol_path, *_ in pending]
-        qc_paths = [qc_path for _, _, _, _, _, qc_path, *_ in pending]
+        inputs = [processed_path for _, processed_path, *_ in pending]
+        segs = [seg_path for _, _, seg_path, *_ in pending]
+        vols = [vol_path for _, _, _, vol_path, *_ in pending]
+        qcs = [qc_path for _, _, _, _, qc_path, *_ in pending]
 
         log.info("SynthSeg: running on %d scan(s)", len(pending))
         run_synthseg(
-            preproc_paths,
-            seg_paths,
-            vol_paths,
-            qc_paths,
+            inputs,
+            segs,
+            vols,
+            qcs,
             synthseg_cmd,
-            synthseg_threads,
+            threads,
             cpu_only,
             timeout=600 * len(pending),
         )
 
-        for name, _, _, seg_path, vol_path, qc_path, *_ in pending:
+        for name, _, seg_path, vol_path, qc_path, mask_path in pending:
             log.info("%s — SynthSeg done → %s", name, seg_path.name)
             log.info("%s — SynthSeg sidecars → %s, %s", name, vol_path.name, qc_path.name)
-            results.append({"file": name, "status": "success"})
+            save_brain_mask_from_segmentation(seg_path, mask_path)
+            log.info("%s — brain mask done → %s", name, mask_path.name)
 
     except subprocess.CalledProcessError as e:
         log.error("SynthSeg batch failed: %s", e, exc_info=True)
@@ -255,58 +241,29 @@ def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
             if text := (text or "").strip():
                 log.error("SynthSeg %s:\n%s", label, text)
         for name, *_ in pending:
-            results.append({"file": name, "status": "failed", "error": str(e)})
+            failed.append(name)
     except Exception as e:
         log.error("SynthSeg batch failed: %s", e, exc_info=True)
         for name, *_ in pending:
-            results.append({"file": name, "status": "failed", "error": str(e)})
+            failed.append(name)
 
-    return results
+    return failed
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Anat preprocessing pipeline")
-    parser.add_argument(
-        "--input", required=True, type=Path,
-        help="Input directory containing .nii.gz files.",
-    )
-    parser.add_argument(
-        "--log-dir", default=None, type=Path, dest="log_dir",
-        help="Log directory (defaults to <input>/derivatives/logs).",
-    )
-    parser.add_argument(
-        "--log-file", default=None, type=Path, dest="log_file",
-        help="Explicit log file path (defaults to <log-dir>/run.log).",
-    )
+    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--log-file", type=Path)
     parser.add_argument(
         "--template-brain", default=None, type=Path, dest="template_brain",
         help="Template brain image for rigid registration (defaults to MNI152NLin2009cAsym res-1 via templateflow).",
     )
-    parser.add_argument("--itk-threads", default=2, type=int, dest="itk_threads",
-                        help="CPU threads for ITK/ANTs.")
-    parser.add_argument("--cpu", action="store_true", default=False,
-                        help="Force SynthSeg CPU-only mode.")
-    parser.add_argument("--synthseg-threads", default=8, type=int, dest="synthseg_threads",
-                        help="CPU threads per SynthSeg call.")
-    stage = parser.add_mutually_exclusive_group()
-    stage.add_argument(
-        "--preproc-only",
-        action="store_true",
-        default=False,
-        dest="preproc_only",
-        help="Run only rigid registration / preprocessing and skip SynthSeg.",
-    )
-    stage.add_argument(
-        "--synthseg-only",
-        action="store_true",
-        default=False,
-        dest="synthseg_only",
-        help="Run only SynthSeg using existing preprocessed files.",
-    )
-    parser.add_argument("--batch-id", default=0, type=int, dest="batch_id",
-                        help="Batch index (0-based) for SLURM/GNU parallel partitioning.")
-    parser.add_argument("--batch-size", default=None, type=int, dest="batch_size",
-                        help="Number of files per batch.")
+    parser.add_argument("--itk-threads", default=2, type=int)
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--synthseg-threads", default=8, type=int)
+    parser.add_argument("--batch-id", default=0, type=int)
+    parser.add_argument("--batch-size", default=None, type=int)
     args = parser.parse_args()
 
     input_dir = args.input.resolve()
@@ -325,8 +282,7 @@ def main() -> None:
     os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(args.itk_threads)
 
     log.info("Input: %s", input_dir)
-    log.info("Preproc: %s", input_dir / "preprocessed")
-    log.info("Matrices: %s", input_dir / "derivatives" / "matrices")
+    log.info("Processed: %s", input_dir / "processed")
     log.info("SynthSeg: %s", input_dir / "derivatives" / "synthseg")
     log.info("Template brain: %s", template_brain)
     log.info("SynthSeg command: %s", DEFAULT_SYNTHSEG_CMD)
@@ -350,51 +306,25 @@ def main() -> None:
         log.info("No files in this batch.")
         return
 
-    reg_results: list[dict] = []
-    reg_succeeded: set[str] = set()
+    reg_failed = []
+    synthseg_tasks = []
+    for f in files:
+        if process_file(f, input_dir, template_brain):
+            processed_path, mask_path, _ = output_paths(f, input_dir)
+            seg_path, vol_path, qc_path = synthseg_output_paths(f, input_dir)
+            synthseg_tasks.append((f, processed_path, seg_path, vol_path, qc_path, mask_path))
+        else:
+            reg_failed.append(str(f.relative_to(input_dir)))
 
-    if not args.synthseg_only:
-        reg_results = [process_file((f, input_dir, template_brain)) for f in files]
-        reg_failed = [r for r in reg_results if r["status"] == "failed"]
-        if reg_failed:
-            log.error("Registration failed for: %s", [r["file"] for r in reg_failed])
-        reg_succeeded = {r["file"] for r in reg_results if r["status"] in ("success", "skipped")}
-        if args.preproc_only:
-            if reg_failed:
-                sys.exit(1)
-            return
-    else:
-        reg_succeeded = {
-            str(f.relative_to(input_dir))
-            for f in files
-            if preproc_output_path(f, input_dir).exists()
-        }
-        missing_preproc = [
-            str(f.relative_to(input_dir))
-            for f in files
-            if str(f.relative_to(input_dir)) not in reg_succeeded
-        ]
-        if missing_preproc:
-            log.error("Missing preprocessed inputs for SynthSeg-only mode: %s", missing_preproc)
-            sys.exit(1)
+    if reg_failed:
+        log.error("Registration failed for: %s", reg_failed)
 
-    synthseg_tasks = [
-        (f, preproc_output_path(f, input_dir), input_dir,
-         DEFAULT_SYNTHSEG_CMD, args.synthseg_threads, args.cpu)
-        for f in files
-        if str(f.relative_to(input_dir)) in reg_succeeded
-    ]
-    synthseg_results = process_synthseg_batch(synthseg_tasks)
-
-    ss_failed = [r for r in synthseg_results if r["status"] == "failed"]
-    ss_succeeded = [r for r in synthseg_results if r["status"] == "success"]
-    ss_skipped = [r for r in synthseg_results if r["status"] == "skipped"]
-    log.info(
-        "SynthSeg — %d succeeded, %d failed, %d skipped",
-        len(ss_succeeded), len(ss_failed), len(ss_skipped),
+    ss_failed = process_synthseg_batch(
+        synthseg_tasks, DEFAULT_SYNTHSEG_CMD, args.synthseg_threads, args.cpu
     )
     if ss_failed:
-        log.error("SynthSeg failed for: %s", [r["file"] for r in ss_failed])
+        log.error("SynthSeg failed for: %s", ss_failed)
+    if reg_failed or ss_failed:
         sys.exit(1)
 
 
