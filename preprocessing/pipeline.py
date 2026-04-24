@@ -55,7 +55,7 @@ def matrix_output_path(input_path: Path, input_dir: Path) -> Path:
     return d / f"{stem}_from-native_to-{TEMPLATE_SPACE}_mode-image_xfm.mat"
 
 
-def synthseg_output_path(input_path: Path, input_dir: Path) -> Path:
+def synthseg_output_paths(input_path: Path, input_dir: Path) -> tuple[Path, Path, Path]:
     stem = input_path.name.replace(".nii.gz", "")
     entities = _bids_entities(stem)
     sub = f"sub-{entities['sub']}" if "sub" in entities else "unknown"
@@ -64,7 +64,10 @@ def synthseg_output_path(input_path: Path, input_dir: Path) -> Path:
     if ses:
         d = d / ses
     d.mkdir(parents=True, exist_ok=True)
-    return d / f"{stem}_desc-synthseg_dseg.nii.gz"
+    seg = d / f"{stem}_desc-synthseg_dseg.nii.gz"
+    vol = d / f"{stem}_volumes.csv"
+    qc = d / f"{stem}_qc.csv"
+    return seg, vol, qc
 
 
 def nib_to_ants(img: nib.Nifti1Image) -> ants.ANTsImage:
@@ -132,6 +135,8 @@ def _parse_synthseg_cmd(command: str) -> list[str]:
 def run_synthseg(
     input_paths: list[Path],
     seg_paths: list[Path],
+    vol_paths: list[Path],
+    qc_paths: list[Path],
     synthseg_cmd: str,
     threads: int,
     cpu_only: bool,
@@ -141,12 +146,18 @@ def run_synthseg(
         tmp_path = Path(tmp)
         input_txt = tmp_path / "inputs.txt"
         output_txt = tmp_path / "outputs.txt"
+        vol_txt = tmp_path / "volumes.txt"
+        qc_txt = tmp_path / "qc.txt"
         input_txt.write_text("\n".join(str(p) for p in input_paths) + "\n")
         output_txt.write_text("\n".join(str(p) for p in seg_paths) + "\n")
+        vol_txt.write_text("\n".join(str(p) for p in vol_paths) + "\n")
+        qc_txt.write_text("\n".join(str(p) for p in qc_paths) + "\n")
 
         cmd = _parse_synthseg_cmd(synthseg_cmd) + [
             "--i", str(input_txt),
             "--o", str(output_txt),
+            "--vol", str(vol_txt),
+            "--qc", str(qc_txt),
             "--parc",
             "--robust",
             "--threads", str(threads),
@@ -191,34 +202,51 @@ def process_synthseg_batch(tasks: list[tuple]) -> list[dict]:
     for task in tasks:
         orig_path, preproc_path, input_dir, synthseg_cmd, synthseg_threads, cpu_only = task
         name = str(orig_path.relative_to(input_dir))
-        seg_path = synthseg_output_path(orig_path, input_dir)
-        if seg_path.exists():
+        seg_path, vol_path, qc_path = synthseg_output_paths(orig_path, input_dir)
+        if seg_path.exists() and vol_path.exists() and qc_path.exists():
             log.info("%s — SynthSeg already done, skipping", name)
             results.append({"file": name, "status": "skipped"})
         else:
-            pending.append((name, orig_path, preproc_path, seg_path, synthseg_cmd, synthseg_threads, cpu_only))
+            pending.append(
+                (
+                    name,
+                    orig_path,
+                    preproc_path,
+                    seg_path,
+                    vol_path,
+                    qc_path,
+                    synthseg_cmd,
+                    synthseg_threads,
+                    cpu_only,
+                )
+            )
 
     if not pending:
         return results
 
-    _, _, _, _, synthseg_cmd, synthseg_threads, cpu_only = pending[0]
+    _, _, _, _, _, _, synthseg_cmd, synthseg_threads, cpu_only = pending[0]
 
     try:
         preproc_paths = [preproc_path for _, _, preproc_path, *_ in pending]
         seg_paths = [seg_path for _, _, _, seg_path, *_ in pending]
+        vol_paths = [vol_path for _, _, _, _, vol_path, *_ in pending]
+        qc_paths = [qc_path for _, _, _, _, _, qc_path, *_ in pending]
 
         log.info("SynthSeg: running on %d scan(s)", len(pending))
         run_synthseg(
             preproc_paths,
             seg_paths,
+            vol_paths,
+            qc_paths,
             synthseg_cmd,
             synthseg_threads,
             cpu_only,
             timeout=600 * len(pending),
         )
 
-        for name, _, _, seg_path, *_ in pending:
+        for name, _, _, seg_path, vol_path, qc_path, *_ in pending:
             log.info("%s — SynthSeg done → %s", name, seg_path.name)
+            log.info("%s — SynthSeg sidecars → %s, %s", name, vol_path.name, qc_path.name)
             results.append({"file": name, "status": "success"})
 
     except subprocess.CalledProcessError as e:
@@ -247,6 +275,10 @@ def main() -> None:
         help="Log directory (defaults to <input>/derivatives/logs).",
     )
     parser.add_argument(
+        "--log-file", default=None, type=Path, dest="log_file",
+        help="Explicit log file path (defaults to <log-dir>/run.log).",
+    )
+    parser.add_argument(
         "--template-brain", default=None, type=Path, dest="template_brain",
         help="Template brain image for rigid registration (defaults to MNI152NLin2009cAsym res-1 via templateflow).",
     )
@@ -256,6 +288,21 @@ def main() -> None:
                         help="Force SynthSeg CPU-only mode.")
     parser.add_argument("--synthseg-threads", default=8, type=int, dest="synthseg_threads",
                         help="CPU threads per SynthSeg call.")
+    stage = parser.add_mutually_exclusive_group()
+    stage.add_argument(
+        "--preproc-only",
+        action="store_true",
+        default=False,
+        dest="preproc_only",
+        help="Run only rigid registration / preprocessing and skip SynthSeg.",
+    )
+    stage.add_argument(
+        "--synthseg-only",
+        action="store_true",
+        default=False,
+        dest="synthseg_only",
+        help="Run only SynthSeg using existing preprocessed files.",
+    )
     parser.add_argument("--batch-id", default=0, type=int, dest="batch_id",
                         help="Batch index (0-based) for SLURM/GNU parallel partitioning.")
     parser.add_argument("--batch-size", default=None, type=int, dest="batch_size",
@@ -272,7 +319,8 @@ def main() -> None:
         raise FileNotFoundError(f"Template brain not found: {template_brain}")
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    log_file = log_dir / "run.log"
+    log_file = (args.log_file.resolve() if args.log_file else log_dir / "run.log")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     setup_logging(log_file)
     os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(args.itk_threads)
 
@@ -302,15 +350,34 @@ def main() -> None:
         log.info("No files in this batch.")
         return
 
-    # Step 1: rigid registration to MNI
-    reg_results = [process_file((f, input_dir, template_brain)) for f in files]
+    reg_results: list[dict] = []
+    reg_succeeded: set[str] = set()
 
-    reg_failed = [r for r in reg_results if r["status"] == "failed"]
-    if reg_failed:
-        log.error("Registration failed for: %s", [r["file"] for r in reg_failed])
+    if not args.synthseg_only:
+        reg_results = [process_file((f, input_dir, template_brain)) for f in files]
+        reg_failed = [r for r in reg_results if r["status"] == "failed"]
+        if reg_failed:
+            log.error("Registration failed for: %s", [r["file"] for r in reg_failed])
+        reg_succeeded = {r["file"] for r in reg_results if r["status"] in ("success", "skipped")}
+        if args.preproc_only:
+            if reg_failed:
+                sys.exit(1)
+            return
+    else:
+        reg_succeeded = {
+            str(f.relative_to(input_dir))
+            for f in files
+            if preproc_output_path(f, input_dir).exists()
+        }
+        missing_preproc = [
+            str(f.relative_to(input_dir))
+            for f in files
+            if str(f.relative_to(input_dir)) not in reg_succeeded
+        ]
+        if missing_preproc:
+            log.error("Missing preprocessed inputs for SynthSeg-only mode: %s", missing_preproc)
+            sys.exit(1)
 
-    # Step 2: SynthSeg on registered (MNI-space) images
-    reg_succeeded = {r["file"] for r in reg_results if r["status"] in ("success", "skipped")}
     synthseg_tasks = [
         (f, preproc_output_path(f, input_dir), input_dir,
          DEFAULT_SYNTHSEG_CMD, args.synthseg_threads, args.cpu)
