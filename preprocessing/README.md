@@ -28,10 +28,9 @@ Normal preprocessing runs also write SynthSeg derivatives under
 
 | File | Description |
 |---|---|
-| `*_res-1mm_desc-synthseg_dseg.nii.gz` | Tissue segmentation |
-| `*_desc-synthseg_dseg.tsv` | Label definitions (51 tissue classes) |
-| `*_desc-synthseg_volumes.tsv` | Volumetric measurements (GMV, WMV, sGMV, TCV, DK parcellation) |
-| `*_desc-synthseg_qc.tsv` | QC scores |
+| `*_desc-synthseg_dseg.nii.gz` | Tissue segmentation |
+| `*_volumes.csv` | Raw SynthSeg volumetric measurements |
+| `*_qc.csv` | Raw SynthSeg QC scores |
 
 Pass `--synthseg` to run only this SynthSeg stage on RAS-canonicalized raw inputs and skip MNI preprocessing outputs.
 
@@ -67,4 +66,3 @@ The default SynthSeg backend is:
 ```bash
 uvx --python 3.11 --from 'git+https://github.com/MedARC-AI/SynthSeg.git' SynthSeg
 ```
-
