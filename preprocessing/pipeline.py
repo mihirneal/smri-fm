@@ -165,6 +165,15 @@ def run_synthseg(
         )
 
 
+def sync_to_r2(local_dir: Path, s3_dest: str, profile: str) -> None:
+    cmd = ["aws", "s3", "sync", str(local_dir) + "/", s3_dest + "/", "--profile", profile]
+    log.info("R2 sync: %s → %s", local_dir, s3_dest)
+    try:
+        subprocess.run(cmd, check=True, text=True, capture_output=True)
+    except Exception as e:
+        log.error("R2 sync failed (%s → %s): %s", local_dir, s3_dest, e)
+
+
 def process_file(input_path: Path, input_dir: Path, template_brain_path: Path) -> bool:
     name = str(input_path.relative_to(input_dir))
     processed_path, _, xfm_path = output_paths(input_path, input_dir)
@@ -264,6 +273,9 @@ def main() -> None:
     parser.add_argument("--synthseg-threads", default=8, type=int)
     parser.add_argument("--batch-id", default=0, type=int)
     parser.add_argument("--batch-size", default=None, type=int)
+    parser.add_argument("--r2-dest", default=None, type=str, dest="r2_dest",
+        help="S3 base URL for R2 sync (e.g. s3://medarc/mihir-stuff/processed/adni). Omit to skip sync.")
+    parser.add_argument("--r2-profile", default="r2", type=str, dest="r2_profile")
     args = parser.parse_args()
 
     input_dir = args.input.resolve()
@@ -323,11 +335,19 @@ def main() -> None:
     if reg_failed:
         log.error("Registration failed for: %s", reg_failed)
 
+    if args.r2_dest:
+        sync_to_r2(input_dir / "processed", args.r2_dest, args.r2_profile)
+
     ss_failed = process_synthseg_batch(
         synthseg_tasks, DEFAULT_SYNTHSEG_CMD, args.synthseg_threads, args.cpu
     )
     if ss_failed:
         log.error("SynthSeg failed for: %s", ss_failed)
+
+    if args.r2_dest:
+        sync_to_r2(input_dir / "derivatives", f"{args.r2_dest}/derivatives", args.r2_profile)
+        sync_to_r2(input_dir / "logs", f"{args.r2_dest}/logs", args.r2_profile)
+
     if reg_failed or ss_failed:
         sys.exit(1)
 
