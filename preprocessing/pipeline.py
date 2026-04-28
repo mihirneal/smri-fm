@@ -287,7 +287,11 @@ def main() -> None:
     log.info("Template brain: %s", template_brain)
     log.info("SynthSeg command: %s", DEFAULT_SYNTHSEG_CMD)
 
-    files = sorted((input_dir / "images").rglob("*.nii.gz"))
+    excluded = {input_dir / "processed", input_dir / "derivatives", input_dir / "logs"}
+    files = sorted(
+        f for f in input_dir.rglob("*.nii.gz")
+        if not any(f.is_relative_to(d) for d in excluded)
+    )
     if not files:
         log.info("No .nii.gz files found in %s", input_dir)
         return
