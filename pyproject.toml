@@ -7,7 +7,7 @@ name = "smri-fm"
 dynamic = ["version"]
 description = "MedARC sMRI foundation model"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "ipython",
     "jupyter",
@@ -17,7 +17,9 @@ dependencies = [
     "omegaconf",
     "pandas",
     "pre-commit",
+    "pyradiomics-fix",
     "pytest",
+    "scikit-learn",
     "scipy",
     "seaborn",
     "tabulate",
@@ -28,6 +30,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
+include = ["baselines*"]
 exclude = ["preprocessing*"]
 
 [tool.setuptools_scm]

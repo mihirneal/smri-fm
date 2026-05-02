@@ -27,7 +27,7 @@ WAVE_TO_AGE = {"wave1": "AgeMRI_W1", "wave2": "AgeMRI_W2", "wave3": "AgeMRI_W3"}
 VOLUME_SUFFIX = "_desc-synthseg_volumes.tsv"
 FILENAME_RE = re.compile(
     r"(?P<participant>sub-[^_]+)_ses-(?P<wave>wave[123])_"
-    r"(?P<scan>.+?)_space-[^_]+_desc-preproc_T1w_desc-synthseg_volumes\.tsv$"
+    r"(?P<scan>.+?)(?:_space-[^_]+_desc-preproc)?_T1w_desc-synthseg_volumes\.tsv$"
 )
 WAVE_COLORS = {"wave1": "#16697a", "wave2": "#d1495b", "wave3": "#edae49"}
 
