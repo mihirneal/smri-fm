@@ -546,22 +546,16 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         dtype: torch.dtype,
         device: torch.device,
     ):
-        # expand all masks to the input shape and cast to the input dtype
-        # intersect visible and pred mask with image data mask
         if img_mask is not None:
             img_mask = _expand_volume_mask(img_mask, shape, dtype, device)
 
         if visible_mask is None:
             visible_mask = img_mask
-        elif img_mask is not None:
-            visible_mask = img_mask * _expand_volume_mask(visible_mask, shape, dtype, device)
         else:
             visible_mask = _expand_volume_mask(visible_mask, shape, dtype, device)
 
         if pred_mask is None:
             pred_mask = img_mask
-        elif img_mask is not None:
-            pred_mask = img_mask * _expand_volume_mask(pred_mask, shape, dtype, device)
         else:
             pred_mask = _expand_volume_mask(pred_mask, shape, dtype, device)
 

@@ -1,4 +1,5 @@
 import inspect
+import json
 import os
 import subprocess
 from glob import glob
@@ -215,9 +216,15 @@ def pad_to_size_3d(img: torch.Tensor, size: tuple[int, int, int]) -> torch.Tenso
 
 
 def make_collatable(value: Any) -> Any:
-    """Replace JSON null values in metadata dictionaries for PyTorch collation."""
+    """Replace JSON null values in metadata dictionaries for PyTorch collation.
+
+    Lists and tuples are stringified because variable-length sequences in
+    metadata break `torch.utils.data.default_collate`.
+    """
     if value is None:
         return ""
     if isinstance(value, dict):
         return {key: make_collatable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return json.dumps(value)
     return value

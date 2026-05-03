@@ -15,7 +15,7 @@ patch_size: 16
 # Masking.
 mask_ratio: 0.75
 pred_mask_ratio: null
-masking: null
+masking: random
 masking_kwargs: {}
 
 # Hybrid 3D masking example.
@@ -49,7 +49,7 @@ model_kwargs:
 datasets:
   aabc_train:
     type: vol-wds
-    url: datasets/aabc/aabc-{000000..000309}.tar
+    url: datasets/aabc/aabc-{000000..000308}.tar
     shuffle: true
     buffer_size: 1000
     samples_per_epoch: 10000
@@ -89,6 +89,8 @@ clip_grad: 1.0
 
 amp: true
 amp_dtype: bfloat16
+
+compile: false
 
 # Checkpointing.
 ckpt: null

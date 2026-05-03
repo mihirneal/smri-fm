@@ -469,8 +469,6 @@ def send_data(x, device=None):
 
     if isinstance(x, torch.Tensor):
         x = x.to(device=device, non_blocking=True)
-        if device.type == "cuda":
-            x.record_stream(torch.cuda.current_stream(device))
         return x
     if isinstance(x, dict):
         return {k: send_data(v, device=device) for k, v in x.items()}

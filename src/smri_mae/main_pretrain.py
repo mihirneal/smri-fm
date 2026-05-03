@@ -73,7 +73,7 @@ def main(args: DictConfig):
 
     ut.setup_for_distributed(log_path=output_dir / "log.txt")
 
-    print("pretraining 3D sMRI MAE")
+    print("pretraining 3D ViTMAE")
     print(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"cwd: {Path.cwd()}")
     print(ut.get_sha())
@@ -99,7 +99,8 @@ def main(args: DictConfig):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
-    # todo: compile?
+    if args.compile:
+        model = torch.compile(model)
 
     # optimizer
     total_batch_size = args.batch_size * args.accum_iter * world_size
@@ -146,9 +147,6 @@ def main(args: DictConfig):
     print(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed and hasattr(train_loader, "sampler"):
-            train_loader.sampler.set_epoch(epoch)
-
         train_stats = train_one_epoch(
             args,
             model,
@@ -194,20 +192,15 @@ def main(args: DictConfig):
 
 
 def create_data_loaders(args: DictConfig):
-    # masking generator
-    # generate masks during collate, following capi
-    if args.masking:
-        mask_fn = masking.create_masking(
-            args.masking,
-            mask_ratio=args.mask_ratio,
-            img_size=args.img_size,
-            patch_size=args.patch_size,
-            **(args.get("masking_kwargs") or {}),
-        )
-        print("mask generator:", mask_fn, sep="\n")
-    else:
-        print("not using custom masking")
-        mask_fn = None
+    # masking generator — always generated at collate time so brain mask is respected
+    mask_fn = masking.create_masking(
+        args.masking,
+        mask_ratio=args.mask_ratio,
+        img_size=args.img_size,
+        patch_size=args.patch_size,
+        **(args.get("masking_kwargs") or {}),
+    )
+    print("mask generator:", mask_fn, sep="\n")
 
     # mask collate needed even if mask_fn is None to pad the masks to the right shape
     collate_fn = partial(masking.mask_collate, mask_fn=mask_fn)
@@ -326,17 +319,14 @@ def train_one_epoch(
 
         images = batch["image"]
         img_mask = batch.get("img_mask")
-        visible_mask = batch.get("visible_mask")
-
-        # visible mask overrides default random masking
-        mask_ratio = args.mask_ratio if visible_mask is None else None
+        visible_mask = batch["visible_mask"]
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
                 img_mask=img_mask,
                 visible_mask=visible_mask,
-                mask_ratio=mask_ratio,
+                mask_ratio=None,
                 pred_mask_ratio=args.pred_mask_ratio,
                 with_state=False,
             )
@@ -409,12 +399,12 @@ def evaluate(
 
             images = batch["image"]
             img_mask = batch.get("img_mask")
-            visible_mask = batch.get("visible_mask")
+            visible_mask = batch["visible_mask"]
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
                 loss, state = model(
                     images,
-                    mask_ratio=args.mask_ratio,
+                    mask_ratio=None,
                     pred_mask_ratio=args.pred_mask_ratio,
                     img_mask=img_mask,
                     visible_mask=visible_mask,
