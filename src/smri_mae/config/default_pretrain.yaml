@@ -1,0 +1,74 @@
+name: null
+notes: null
+output_dir: outputs/pretrain
+device: cuda
+seed: 0
+debug: false
+
+model: mae_vit_small
+img_size: [208, 240, 208]
+patch_size: [16, 16, 16]
+in_chans: 1
+model_kwargs:
+  pos_embed: sincos
+  target_norm: none
+  decoding: attn
+  t_pred_stride: 1
+  pred_edge_pad: 0
+
+masking: hybrid
+mask_ratio: 0.75
+pred_mask_ratio: null
+masking_kwargs:
+  block_size: [2, 2, 2]
+  random_fraction: 0.5
+  block_fraction: 0.5
+
+train_dataset: aabc_train
+eval_datasets: [aabc_eval]
+datasets:
+  aabc_train:
+    type: vol-wds
+    url: datasets/aabc/aabc-{000000..000309}.tar
+    shuffle: true
+    buffer_size: 1000
+    samples_per_epoch: 1000
+  aabc_eval:
+    type: vol-wds
+    url: datasets/aabc/aabc-000000.tar
+    shuffle: false
+    samples_per_epoch: 1
+
+batch_size: 1
+accum_iter: 1
+epochs: 100
+start_epoch: 0
+num_workers: 4
+presend_cuda: false
+
+lr: null
+base_lr: 0.00015
+min_lr: 0.0
+warmup_epochs: 10
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: null
+
+amp: true
+amp_dtype: bfloat16
+
+wandb: false
+wandb_entity: null
+wandb_project: smri-fm
+
+ckpt: null
+resume: false
+auto_resume: true
+checkpoint_period: 1
+max_checkpoints: 5
+r2_sync:
+  url: null
+  profile: null
+
+distributed: false
+gpu: 0
