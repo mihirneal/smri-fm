@@ -23,9 +23,10 @@ _version.py
 .ipynb_checkpoints
 
 # Local data directories
-**/data
+/preprocessing/data/
 /DLBS/
 /BrainIAC/
+*.tar
 
 # Local scratch/tmp
 .scratch

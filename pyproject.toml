@@ -9,9 +9,15 @@ description = "MedARC sMRI foundation model"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    "braceexpand",
+    "cloudpathlib",
+    "einops",
+    "huggingface-hub",
     "ipython",
+    "jaxtyping",
     "jupyter",
     "matplotlib",
+    "nibabel",
     "numpy",
     "omegaconf",
     "pandas",
@@ -20,10 +26,12 @@ dependencies = [
     "scipy",
     "seaborn",
     "tabulate",
+    "timm",
     "torch==2.8.0",
     "torchvision",
     "tqdm",
     "wandb",
+    "webdataset",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +42,7 @@ preprocessing = [
 ]
 
 [tool.setuptools.packages.find]
+where = ["src"]
 exclude = ["preprocessing*"]
 
 [tool.setuptools_scm]
