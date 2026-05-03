@@ -13,6 +13,7 @@ import os
 import random
 import subprocess
 import time
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -84,7 +85,7 @@ def main(args: DictConfig):
     # model
     model = MODELS_DICT[args.model](
         img_size=args.img_size,
-        in_chans=args.in_chans,
+        in_chans=args.get("in_chans", 1),
         patch_size=args.patch_size,
         **(args.get("model_kwargs") or {}),
     )
@@ -215,6 +216,7 @@ def create_data_loaders(args: DictConfig):
     dataset_names = [args.train_dataset] + args.eval_datasets
 
     for dataset_name in dataset_names:
+        is_train_dataset = dataset_name == args.train_dataset
         dataset_config = args.datasets[dataset_name].copy()
         print(f"loading dataset: {dataset_name}\n\n{OmegaConf.to_yaml(dataset_config)}")
 
@@ -235,7 +237,9 @@ def create_data_loaders(args: DictConfig):
             collate_fn=collate_fn,
             sampler=sampler,
             shuffle=shuffle,
-            num_workers=args.num_workers,
+            num_workers=args.num_workers
+            if is_train_dataset
+            else args.get("eval_num_workers", args.num_workers),
             pin_memory=True,
             drop_last=True,
         )
@@ -299,10 +303,6 @@ def train_one_epoch(
     epoch_num_batches = len(data_loader)
     steps_per_epoch = epoch_num_batches // args.accum_iter
 
-    use_cuda = device.type == "cuda"
-    if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device)
-
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
 
@@ -313,7 +313,7 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(
         metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
     ):
-        if use_cuda and not args.presend_cuda:
+        if device.type == "cuda":
             batch = ut.send_data(batch, device)
 
         batch_step = batch_idx + 1
@@ -365,7 +365,7 @@ def train_one_epoch(
                 log_stats.update({"train/lr": lr, "train/grad": grad_norm_value})
             wandb.log(log_stats, step=int(1000 * (epoch + batch_step / epoch_num_batches)))
 
-        if use_cuda:
+        if device.type == "cuda":
             torch.cuda.synchronize()
 
     # gather the stats from all processes
@@ -391,47 +391,45 @@ def evaluate(
 
     epoch_num_batches = len(data_loader)
 
-    use_cuda = device.type == "cuda"
-    if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device)
-
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
-    example_step = random.randint(1, num_batches)
+    eval_seed = make_eval_seed(args, epoch, eval_name)
 
-    amp_dtype = getattr(torch, args.amp_dtype)
+    with temporary_eval_seed(eval_seed, device):
+        example_step = random.randint(1, num_batches)
+        amp_dtype = getattr(torch, args.amp_dtype)
 
-    for batch_idx, batch in enumerate(
-        metric_logger.log_every(data_loader, print_freq, header, total_steps=epoch_num_batches)
-    ):
-        if use_cuda and not args.presend_cuda:
-            batch = ut.send_data(batch, device)
+        for batch_idx, batch in enumerate(
+            metric_logger.log_every(data_loader, print_freq, header, total_steps=epoch_num_batches)
+        ):
+            if device.type == "cuda":
+                batch = ut.send_data(batch, device)
 
-        batch_step = batch_idx + 1
+            batch_step = batch_idx + 1
 
-        images = batch["image"]
-        img_mask = batch.get("img_mask")
-        visible_mask = batch.get("visible_mask")
+            images = batch["image"]
+            img_mask = batch.get("img_mask")
+            visible_mask = batch.get("visible_mask")
 
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss, state = model(
-                images,
-                mask_ratio=args.mask_ratio,
-                pred_mask_ratio=args.pred_mask_ratio,
-                img_mask=img_mask,
-                visible_mask=visible_mask,
-            )
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
+                loss, state = model(
+                    images,
+                    mask_ratio=args.mask_ratio,
+                    pred_mask_ratio=args.pred_mask_ratio,
+                    img_mask=img_mask,
+                    visible_mask=visible_mask,
+                )
 
-        metric_logger.update(loss=loss)
+            metric_logger.update(loss=loss)
 
-        if batch_step == example_step:
-            example_data = {
-                "batch": ut.send_data(batch, "cpu"),
-                "state": ut.send_data(state, "cpu"),
-            }
+            if batch_step == example_step:
+                example_data = {
+                    "batch": ut.send_data(batch, "cpu"),
+                    "state": ut.send_data(state, "cpu"),
+                }
 
-        if use_cuda:
-            torch.cuda.synchronize()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -449,6 +447,34 @@ def evaluate(
             step=1000 * (epoch + 1),
         )
     return stats, plots
+
+
+def make_eval_seed(args: DictConfig, epoch: int, eval_name: str) -> int:
+    base_seed = int(args.get("eval_seed", args.get("seed", 0)))
+    name_offset = sum((idx + 1) * ord(char) for idx, char in enumerate(eval_name))
+    return base_seed + 1009 * int(epoch) + name_offset
+
+
+@contextmanager
+def temporary_eval_seed(seed: int, device: torch.device):
+    python_state = random.getstate()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        cuda_states = torch.cuda.get_rng_state_all()
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def make_plots(

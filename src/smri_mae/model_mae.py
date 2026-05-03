@@ -942,6 +942,11 @@ def vit_small(**kwargs):
     return _create_vit(**model_args, **kwargs)
 
 
+def vit_large(**kwargs):
+    model_args = dict(embed_dim=1024, depth=24, num_heads=16)
+    return _create_vit(**model_args, **kwargs)
+
+
 def mae_vit_small(**kwargs):
     model_args = dict(embed_dim=384, depth=12, num_heads=6)
     return _create_mae_vit(**model_args, **kwargs)
@@ -949,6 +954,16 @@ def mae_vit_small(**kwargs):
 
 def mae_vit_base(**kwargs):
     model_args = dict(embed_dim=768, depth=12, num_heads=12)
+    return _create_mae_vit(**model_args, **kwargs)
+
+
+def mae_vit_large(**kwargs):
+    model_args = dict(embed_dim=1024, depth=24, num_heads=16)
+    return _create_mae_vit(**model_args, **kwargs)
+
+
+def mae_vit_huge(**kwargs):
+    model_args = dict(embed_dim=1280, depth=32, num_heads=16)
     return _create_mae_vit(**model_args, **kwargs)
 
 
