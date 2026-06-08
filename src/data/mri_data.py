@@ -18,10 +18,31 @@ def collate(
 ) -> dict[str, Tensor]:
     masks = [torch.as_tensor(sample["img_mask"].copy()) for sample in samples]
     batch = {"img_mask": torch.stack(masks)}
-    image_values = [
-        torch.as_tensor(sample["image_values"].copy(), dtype=torch.float16) for sample in samples
-    ]
+    image_values = [torch.as_tensor(sample["image_values"].copy()) for sample in samples]
+    image_dtypes = {values.dtype for values in image_values}
+    if len(image_dtypes) != 1:
+        raise ValueError(f"mixed image_values dtypes in batch: {sorted(map(str, image_dtypes))}")
     batch["image_values"] = torch.cat(image_values)
+
+    quantizations = [sample.get("image_quantization") for sample in samples]
+    if any(quantization is not None for quantization in quantizations):
+        if not all(quantization is not None for quantization in quantizations):
+            raise ValueError("cannot mix quantized and unquantized image values in one batch")
+        batch["image_quantization"] = {
+            "scale": torch.tensor(
+                [quantization["scale"] for quantization in quantizations], dtype=torch.float32
+            ),
+            "value_min": torch.tensor(
+                [quantization["value_min"] for quantization in quantizations],
+                dtype=torch.float32,
+            ),
+            "qmin": torch.tensor(
+                [quantization["qmin"] for quantization in quantizations], dtype=torch.int16
+            ),
+            "value_counts": torch.tensor(
+                [values.numel() for values in image_values], dtype=torch.int64
+            ),
+        }
 
     if include_meta:
         batch["meta"] = [make_collatable(sample["meta"]) for sample in samples]
@@ -48,6 +69,7 @@ def densify_sparse_image_batch(
     packed_img_mask: torch.Tensor,
     image_shape: Sequence[int],
     *,
+    image_quantization: dict[str, torch.Tensor] | None = None,
     dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reconstruct dense images from concatenated brain-voxel values and packed masks."""
@@ -61,7 +83,15 @@ def densify_sparse_image_batch(
         device=image_values.device,
         dtype=dtype,
     )
-    images[masks] = image_values.to(dtype=dtype)
+    if image_quantization is not None:
+        counts = image_quantization["value_counts"]
+        scales = torch.repeat_interleave(image_quantization["scale"], counts)
+        value_mins = torch.repeat_interleave(image_quantization["value_min"], counts)
+        qmins = torch.repeat_interleave(image_quantization["qmin"], counts)
+        dense_values = (image_values.float() - qmins.float()) * scales + value_mins
+    else:
+        dense_values = image_values
+    images[masks] = dense_values.to(dtype=dtype)
     return images, masks
 
 
@@ -111,11 +141,37 @@ def warn_and_continue(exn):
     return True
 
 
-def extract_sparse_wds_sample(sample: dict) -> dict:
+def image_quantization_from_meta(meta: dict) -> dict[str, float | int] | None:
+    quantization = meta.get("int8_quantization")
+    if not quantization:
+        return None
+
+    if quantization.get("storage_dtype") != "int8":
+        raise ValueError(f"unsupported image_values storage dtype: {quantization.get('storage_dtype')}")
+    scheme = quantization.get("scheme")
+    if scheme != "affine_per_sample_minmax":
+        raise ValueError(f"unsupported image_values quantization: {scheme}")
+
+    domain = quantization.get("domain", "normalized")
+    if domain != "normalized":
+        raise ValueError(f"unsupported image_values quantization domain: {domain}")
+
     return {
-        "image_values": np.asarray(sample["image_values.npy"], dtype=np.float16),
+        "scale": float(quantization["scale"]),
+        "value_min": float(quantization["value_min"]),
+        "qmin": int(quantization["qmin"]),
+    }
+
+
+def extract_sparse_wds_sample(sample: dict) -> dict:
+    meta = sample["meta.json"]
+    quantization = image_quantization_from_meta(meta)
+    values_dtype = np.int8 if quantization is not None else np.float16
+    return {
+        "image_values": np.asarray(sample["image_values.npy"], dtype=values_dtype),
+        "image_quantization": quantization,
         "img_mask": np.asarray(sample["img_mask.npy"], dtype=np.uint8),
-        "meta": sample["meta.json"],
+        "meta": meta,
     }
 
 
