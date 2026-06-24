@@ -1,0 +1,60 @@
+name: fomo_brain_age_gap_probe
+output_dir: data/runs/evaluation
+wandb_logging: true
+
+task:
+  name: fomo_brain_age_gap
+  overwrite_data: false
+  data_root: /data/luka.secerovic/FOMO26/asparagus/data/REGR002_FOMO26_BrainAge
+  split: split_80_10_10
+  test_split: TEST_80_10_10
+  fold: 0
+
+model:
+  name: smri_mae
+  checkpoint_path: /data/mihir-stuff/smri-pretrained/pretrain_full_90_10_h100/checkpoint-last.pth
+  use_input_mask: false
+  calculate_mask: mean
+  img_size: [208, 240, 208]
+  patch_size: 8
+  # Kwargs can be anything...
+  model_kwargs:
+    class_token: true
+    reg_tokens: 0
+    drop_path_rate: 0.0
+    depth: 24
+    embed_dim: 1024
+    num_heads: 16
+    in_chans: 1
+
+transforms:
+  name: pad_center_crop
+  key: image
+  size: [208, 240, 208]
+  pad_value: 0.0
+
+mode:
+  name: probe
+
+# Representation defines what part of encoder output gets
+# passed to the head
+representation: cls
+
+head:
+  name: linear
+  # pooling - first and mean supported
+  pooling: first
+
+optimization:
+  epochs: 50
+  batch_size: 4
+  lr: 1e-3
+  weight_decay: 0.0
+  num_workers: 0
+
+evaluation:
+  selection_metric: mae
+  selection_mode: min
+
+device: cuda
+seed: 7338
