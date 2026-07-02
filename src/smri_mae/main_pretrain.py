@@ -40,6 +40,16 @@ def masking_policy_from_config(args: DictConfig) -> str:
     return "per_sample_pad" if args.get("per_sample_pad", False) else "batch_min"
 
 
+def masking_kwargs_from_config(args: DictConfig) -> dict:
+    return {
+        "masking_policy": masking_policy_from_config(args),
+        "masking_strategy": args.get("masking_strategy", "random"),
+        "block_mask_fraction": args.get("block_mask_fraction", 0.7),
+        "block_mask_min_size": args.get("block_mask_min_size", 2),
+        "block_mask_max_size": args.get("block_mask_max_size", 6),
+    }
+
+
 def main(args: DictConfig):
     # setup
     ut.init_distributed_mode(args)
@@ -291,6 +301,7 @@ def train_one_epoch(
             batch["image_values"],
             batch["img_mask"],
             (int(args.get("in_chans", 1)), *args.img_size),
+            image_quantization=batch.get("image_quantization"),
             dtype=amp_dtype,
         )
 
@@ -300,7 +311,7 @@ def train_one_epoch(
                 img_mask=img_mask,
                 mask_ratio=args.mask_ratio,
                 pred_mask_ratio=args.pred_mask_ratio,
-                masking_policy=masking_policy_from_config(args),
+                **masking_kwargs_from_config(args),
                 with_state=False,
             )
 
@@ -388,6 +399,7 @@ def evaluate(
             batch["image_values"],
             batch["img_mask"],
             (int(args.get("in_chans", 1)), *args.img_size),
+            image_quantization=batch.get("image_quantization"),
             dtype=amp_dtype,
         )
 
@@ -397,7 +409,7 @@ def evaluate(
                 img_mask=img_mask,
                 mask_ratio=args.mask_ratio,
                 pred_mask_ratio=args.pred_mask_ratio,
-                masking_policy=masking_policy_from_config(args),
+                **masking_kwargs_from_config(args),
             )
 
         metric_logger.update(loss=loss)

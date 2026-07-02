@@ -6,6 +6,7 @@ import torch
 from matplotlib import patches
 from matplotlib import pyplot as plt
 from PIL import Image
+from timm.layers import to_3tuple
 from torch import Tensor
 
 VIEW_NAMES = {
@@ -62,6 +63,12 @@ def plot_mask_pred(
     raw_mean: float | Tensor | None = None,
     raw_std: float | Tensor | None = None,
 ):
+    """
+    Plot masked input, reconstruction composite, and target slices.
+
+    Set ``mask_style="boxes"`` to overlay patch-grid boxes on every predicted
+    patch, which is useful for checking mixed block/random masking geometry.
+    """
     del visible_mask
 
     target_vol = _select_volume(target, sample_idx=sample_idx, channel_idx=channel_idx)
@@ -83,7 +90,7 @@ def plot_mask_pred(
     composite_vol = _prediction_composite(target_vol, pred_vol, pred_mask_vol)
     vmin, vmax = _intensity_limits(target_vol, img_mask_vol)
 
-    patch_size = _as_3tuple(patch_size)
+    patch_size = to_3tuple(patch_size)
     view_items = []
     for view in views:
         view_key = view.lower()
@@ -298,14 +305,6 @@ def _content_crop(mask: Tensor, patch_size: tuple[int, int]) -> tuple[slice, sli
     col0 = max((int(cols.min()) // patch_w - 1) * patch_w, 0)
     col1 = min((int(cols.max()) // patch_w + 2) * patch_w, width)
     return slice(row0, row1), slice(col0, col1)
-
-
-def _as_3tuple(value: int | tuple[int, int, int]) -> tuple[int, int, int]:
-    if isinstance(value, int):
-        return (value, value, value)
-    if len(value) != 3:
-        raise ValueError(f"expected a 3-tuple patch size, got {value!r}")
-    return tuple(int(v) for v in value)
 
 
 def _view_patch_size(view: str, patch_size: tuple[int, int, int]) -> tuple[int, int]:

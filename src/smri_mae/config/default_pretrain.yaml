@@ -16,6 +16,12 @@ patch_size: 8
 mask_ratio: 0.80
 pred_mask_ratio: null
 per_sample_pad: true
+masking_strategy: block
+block_mask_fraction: 0.70
+block_mask_min_size: 2
+block_mask_max_size: 6
+fig_kwargs:
+  mask_style: boxes
 
 # Model.
 model: mae_vit_large
@@ -63,8 +69,8 @@ presend_cuda: false
 
 # Optimization.
 epochs: 100
-batch_size: 64
-accum_iter: 1
+batch_size: 8
+accum_iter: 8
 
 base_lr: 0.001
 min_lr: 1e-6

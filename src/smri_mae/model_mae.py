@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch import Tensor
 from huggingface_hub import PyTorchModelHubMixin
 from jaxtyping import Float, Int
+from timm.layers import to_3tuple
 
 from .modules import (
     Block,
@@ -36,6 +37,9 @@ from .modules import (
 )
 from .masking import (
     MaskingPolicy,
+    MaskingStrategy,
+    block_patch_mask,
+    patch_ids_from_mask,
     pad_patch_mask,
     trim_patch_mask,
 )
@@ -179,6 +183,10 @@ class MaskedEncoder(nn.Module):
         mask: Tensor | None = None,
         mask_ratio: float | None = None,
         masking_policy: MaskingPolicy = "batch_min",
+        masking_strategy: MaskingStrategy = "random",
+        block_mask_fraction: float = 0.7,
+        block_mask_min_size: int | Sequence[int] = 2,
+        block_mask_max_size: int | Sequence[int] = 6,
         return_token_mask: bool = False,
     ) -> tuple[
         Float[Tensor, "B 1 D"] | None,
@@ -196,8 +204,9 @@ class MaskedEncoder(nn.Module):
     ]:
         """
         x: input data shape [B, C, D, H, W] 
-        mask: visible mask, 1 = visible, 0 = invisible. broadcastable shape
-        mask_ratio: mask ratio for uniform random masking
+        mask: valid data mask, 1 = visible candidate, 0 = invalid. broadcastable shape
+        mask_ratio: ratio of valid patches hidden from the encoder
+        masking_strategy: random independent patches or mixed block/random patches
 
         returns:
         - cls_embeds: [B, 1, D]
@@ -236,20 +245,43 @@ class MaskedEncoder(nn.Module):
         if mask is not None or mask_ratio is not None:
             mask_ratio = 0.0 if mask_ratio is None else mask_ratio
             token_mask = None
-            if masking_policy == "per_sample_pad":
-                patch_mask, mask_ids, token_mask = pad_patch_mask(
+
+            if masking_strategy == "block":
+                patch_mask = block_patch_mask(
                     patch_mask,
+                    grid_size=self.patchify.grid_size,
                     mask_ratio=mask_ratio,
-                    shuffle=mask_ratio > 0,
+                    block_fraction=block_mask_fraction,
+                    block_size_min=block_mask_min_size,
+                    block_size_max=block_mask_max_size,
                 )
-            elif masking_policy == "batch_min":
-                patch_mask, mask_ids = trim_patch_mask(
-                    patch_mask,
-                    mask_ratio=mask_ratio,
-                    shuffle=mask_ratio > 0,
-                )
+                if masking_policy == "per_sample_pad":
+                    mask_ids, token_mask = patch_ids_from_mask(patch_mask)
+                elif masking_policy == "batch_min":
+                    patch_mask, mask_ids = trim_patch_mask(
+                        patch_mask,
+                        mask_ratio=0.0,
+                        shuffle=True,
+                    )
+                else:
+                    raise ValueError(f"unknown masking_policy {masking_policy!r}")
+            elif masking_strategy == "random":
+                if masking_policy == "per_sample_pad":
+                    patch_mask, mask_ids, token_mask = pad_patch_mask(
+                        patch_mask,
+                        mask_ratio=mask_ratio,
+                        shuffle=mask_ratio > 0,
+                    )
+                elif masking_policy == "batch_min":
+                    patch_mask, mask_ids = trim_patch_mask(
+                        patch_mask,
+                        mask_ratio=mask_ratio,
+                        shuffle=mask_ratio > 0,
+                    )
+                else:
+                    raise ValueError(f"unknown masking_policy {masking_policy!r}")
             else:
-                raise ValueError(f"unknown masking_policy {masking_policy!r}")
+                raise ValueError(f"unknown masking_strategy {masking_strategy!r}")
 
             mask_patches = mask_patches & patch_mask.unsqueeze(-1)
             mask = self.patchify.unpatchify(mask_patches)
@@ -539,8 +571,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
     ):
         super().__init__()
-        img_size = _to_3d_tuple(img_size, "img_size")
-        patch_size = _to_3d_tuple(patch_size, "patch_size")
+        img_size = to_3tuple(img_size)
+        patch_size = to_3tuple(patch_size)
 
         assert not decoding == "crossreg" or reg_tokens > 0, "crossreg decoding requires registers"
 
@@ -796,6 +828,10 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         mask_ratio: float,
         pred_mask_ratio: float | None = None,
         masking_policy: MaskingPolicy = "batch_min",
+        masking_strategy: MaskingStrategy = "random",
+        block_mask_fraction: float = 0.7,
+        block_mask_min_size: int | Sequence[int] = 2,
+        block_mask_max_size: int | Sequence[int] = 6,
         with_state: bool = True,
     ) -> Tensor | tuple[Tensor, dict[str, Tensor]] | tuple[Tensor, dict]:
         img_mask, visible_mask, pred_mask = self.prepare_masks(
@@ -818,6 +854,10 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             mask=visible_mask,
             mask_ratio=mask_ratio,
             masking_policy=masking_policy,
+            masking_strategy=masking_strategy,
+            block_mask_fraction=block_mask_fraction,
+            block_mask_min_size=block_mask_min_size,
+            block_mask_max_size=block_mask_max_size,
             return_token_mask=True,
         )
 
@@ -891,7 +931,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         model_kwargs = {k: args[k] for k in ["img_size", "in_chans", "patch_size"] if k in args}
         model_kwargs.update(args["model_kwargs"] or {})
         model_kwargs.update(kwargs)
-        model_fn = MODELS_DICT[args["model"]]
+        model_fn = globals()[args["model"]]
         model = model_fn(**model_kwargs)
         model.load_state_dict(ckpt["model"])
         return model
@@ -917,8 +957,8 @@ class MaskedViT(MaskedEncoder, PyTorchModelHubMixin):
         mask_drop_scale: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
     ):
-        img_size = _to_3d_tuple(img_size, "img_size")
-        patch_size = _to_3d_tuple(patch_size, "patch_size")
+        img_size = to_3tuple(img_size)
+        patch_size = to_3tuple(patch_size)
 
         patchify = Patchify3D(img_size, patch_size, in_chans=in_chans)
         patch_embed = nn.Linear(patchify.patch_dim, embed_dim)
@@ -970,14 +1010,6 @@ class MaskedViT(MaskedEncoder, PyTorchModelHubMixin):
         if mask is not None:
             mask = mask.to(device=x.device, dtype=x.dtype)
         return super().forward_embedding(x, mask=mask, mask_ratio=mask_ratio)
-
-
-def _to_3d_tuple(value: int | Sequence[int], name: str) -> tuple[int, int, int]:
-    if isinstance(value, int):
-        return (value, value, value)
-    if len(value) != 3:
-        raise ValueError(f"{name} must have exactly 3 spatial dimensions, got {tuple(value)}")
-    return tuple(int(item) for item in value)
 
 
 # JAX ViT xavier uniform init

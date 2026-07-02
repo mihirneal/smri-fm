@@ -1,12 +1,23 @@
 import math
+from collections.abc import Sequence
 from typing import Literal
 
 import torch
 from jaxtyping import Float, Int
+from timm.layers import to_3tuple
 from torch import Tensor
 
 
 MaskingPolicy = Literal["batch_min", "per_sample_pad"]
+MaskingStrategy = Literal["random", "block"]
+
+
+def _keep_counts(valid_counts: Tensor, mask_ratio: float) -> Tensor:
+    """Per-row visible counts. The epsilon absorbs float error in (1 - mask_ratio),
+    e.g. floor(10 * (1 - 0.9)) = floor(0.999...) = 0 instead of 1."""
+    return torch.floor(
+        valid_counts.to(torch.float64) * (1.0 - mask_ratio) + 1e-6
+    ).to(torch.long)
 
 
 def trim_patch_mask(
@@ -32,7 +43,7 @@ def trim_patch_mask(
         patch_mask = patch_mask.gather(1, shuffle_ids)
 
     min_count = patch_mask.sum(dim=1).min()
-    num_keep = int((1 - mask_ratio) * min_count.item())
+    num_keep = int(_keep_counts(min_count, mask_ratio))
     patch_mask = patch_mask * (patch_mask.cumsum(dim=1) <= num_keep)
 
     if shuffle:
@@ -56,6 +67,8 @@ def pad_patch_mask(
     - padded selected patch ids [B, Lmax]
     - token mask [B, Lmax], true for real ids and false for padding
     """
+    if not 0.0 <= mask_ratio <= 1.0:
+        raise ValueError(f"mask_ratio must be in [0, 1], got {mask_ratio}")
 
     B, N = patch_mask.shape
     device = patch_mask.device
@@ -68,7 +81,7 @@ def pad_patch_mask(
         patch_mask = patch_mask.gather(1, shuffle_ids)
 
     valid_counts = patch_mask.sum(dim=1)
-    num_keep = torch.floor(valid_counts.to(torch.float64) * (1.0 - mask_ratio)).to(torch.long)
+    num_keep = _keep_counts(valid_counts, mask_ratio)
     selected = patch_mask & (patch_mask.cumsum(dim=1) <= num_keep.unsqueeze(1))
 
     if shuffle:
@@ -117,30 +130,31 @@ def block_patch_mask(
     valid_patch_mask: Tensor,
     grid_size: tuple[int, int, int],
     mask_ratio: float,
-    block_size_min: int,
-    block_size_max: int,
+    block_fraction: float,
+    block_size_min: int | Sequence[int],
+    block_size_max: int | Sequence[int],
     generator: torch.Generator | None = None,
 ) -> Tensor:
     """
-    Select visible patches after masking unions of random 3D cubes.
+    Select visible patches after mixed block and random masking.
 
-    Cubes are centered on valid patches and shifted inward at grid boundaries so
-    their sampled side length is preserved. The final cube is trimmed when needed
-    so every batch item has the same visible count.
+    Cuboids are sampled in patch-grid coordinates, centered on valid patches not yet
+    hidden, and shifted inward at grid boundaries so their sampled side lengths are
+    preserved.
+    The block portion of the hidden-patch budget is filled first; any remaining
+    budget is selected uniformly from valid patches not already hidden.
     """
     if not 0.0 <= mask_ratio <= 1.0:
         raise ValueError(f"mask_ratio must be in [0, 1], got {mask_ratio}")
-    if block_size_min <= 0 or block_size_max <= 0:
-        raise ValueError("block sizes must be positive")
-    if block_size_min > block_size_max:
+
+    block_size_min = to_3tuple(block_size_min)
+    block_size_max = to_3tuple(block_size_max)
+    if any(min_size > max_size for min_size, max_size in zip(block_size_min, block_size_max)):
         raise ValueError(
-            f"block_size_min ({block_size_min}) must not exceed "
-            f"block_size_max ({block_size_max})"
+            f"block_size_min {block_size_min} must not exceed block_size_max {block_size_max}"
         )
-    if block_size_max > min(grid_size):
-        raise ValueError(
-            f"block_size_max ({block_size_max}) must fit patch grid {grid_size}"
-        )
+    if any(max_size > grid for max_size, grid in zip(block_size_max, grid_size)):
+        raise ValueError(f"block_size_max {block_size_max} must fit patch grid {grid_size}")
 
     B, N = valid_patch_mask.shape
     if N != math.prod(grid_size):
@@ -150,13 +164,16 @@ def block_patch_mask(
 
     valid_patch_mask = valid_patch_mask.to(dtype=torch.bool)
     valid_counts = valid_patch_mask.sum(dim=1)
-    num_keep = int((1 - mask_ratio) * valid_counts.min().item())
-    if num_keep == 0:
-        return torch.zeros_like(valid_patch_mask)
-
+    num_keep = _keep_counts(valid_counts, mask_ratio)
     target_hidden = valid_counts - num_keep
+    target_block_hidden = torch.floor(
+        target_hidden.to(torch.float64) * block_fraction
+    ).to(torch.long)
     if not target_hidden.any():
         return valid_patch_mask
+    if not target_block_hidden.any():
+        hidden = _random_mask_subset(valid_patch_mask, target_hidden, generator=generator)
+        return valid_patch_mask & ~hidden
 
     device = valid_patch_mask.device
     grid_axes = torch.meshgrid(
@@ -167,17 +184,19 @@ def block_patch_mask(
     coord_t, coord_h, coord_w = patch_coords.unbind(dim=-1)
 
     hidden = torch.zeros_like(valid_patch_mask)
-    complete = target_hidden == 0
+    complete = target_block_hidden == 0
     chunk_size = 4
-    max_blocks = max(64, 4 * math.ceil(N / (block_size_max**3)))
+    min_block_volume = math.prod(block_size_min)
+    max_blocks = max(64, 4 * math.ceil(N / min_block_volume))
     num_chunks = math.ceil(max_blocks / chunk_size)
 
-    center_weights = valid_patch_mask.to(dtype=torch.float32)
-    empty_rows = center_weights.sum(dim=1) == 0
-    if empty_rows.any():
-        center_weights[empty_rows, 0] = 1.0
-
     for _ in range(num_chunks):
+        # anchor new blocks on valid patches not already hidden, so successive
+        # blocks spread out instead of resampling covered regions
+        center_weights = (valid_patch_mask & ~hidden).to(dtype=torch.float32)
+        empty_rows = center_weights.sum(dim=1) == 0
+        if empty_rows.any():
+            center_weights[empty_rows, 0] = 1.0
         center_ids = torch.multinomial(
             center_weights,
             num_samples=chunk_size,
@@ -185,18 +204,24 @@ def block_patch_mask(
             generator=generator,
         )
         centers = patch_coords[center_ids]
-        side_lengths = torch.randint(
-            block_size_min,
-            block_size_max + 1,
-            (B, chunk_size),
-            device=device,
-            generator=generator,
+        side_lengths = torch.stack(
+            [
+                torch.randint(
+                    min_size,
+                    max_size + 1,
+                    (B, chunk_size),
+                    device=device,
+                    generator=generator,
+                )
+                for min_size, max_size in zip(block_size_min, block_size_max)
+            ],
+            dim=-1,
         )
-        starts = centers - side_lengths.unsqueeze(-1) // 2
-        max_starts = torch.tensor(grid_size, device=device) - side_lengths.unsqueeze(-1)
+        starts = centers - side_lengths // 2
+        max_starts = torch.tensor(grid_size, device=device) - side_lengths
         starts = starts.clamp(min=0)
         starts = torch.minimum(starts, max_starts)
-        ends = starts + side_lengths.unsqueeze(-1)
+        ends = starts + side_lengths
         cube_mask = (
             (coord_t >= starts[:, :, 0].unsqueeze(-1))
             & (coord_t < ends[:, :, 0].unsqueeze(-1))
@@ -215,7 +240,7 @@ def block_patch_mask(
             union_states.append(running_hidden)
         union_states = torch.stack(union_states, dim=1)
         hidden_counts = union_states.sum(dim=-1)
-        reaches_target = hidden_counts >= target_hidden.unsqueeze(1)
+        reaches_target = hidden_counts >= target_block_hidden.unsqueeze(1)
         reaches_in_chunk = reaches_target.any(dim=1) & ~complete
 
         first_reach = reaches_target.to(torch.int64).argmax(dim=1)
@@ -228,7 +253,7 @@ def block_patch_mask(
             previous_hidden,
         )
         final_candidates = cube_mask[batch_ids, first_reach] & ~previous_hidden
-        needed = (target_hidden - previous_hidden.sum(dim=1)).clamp(min=0)
+        needed = (target_block_hidden - previous_hidden.sum(dim=1)).clamp(min=0)
         final_additions = _random_mask_subset(
             final_candidates,
             needed,
