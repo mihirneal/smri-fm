@@ -3,20 +3,14 @@ from dataclasses import dataclass
 
 import numpy as np
 from datasets import Dataset as HFDataset
-from scipy import stats
 
 from evaluation.tasks.base import Kind
+from evaluation.tasks.metrics import pearson_r
 
 
 @dataclass
 class BrainAgeGapTask:
-    """Train age regression on healthy controls, then score how the brain age
-    gap (``age_pred - age_true``) separates cases from controls at test.
-
-    The estimator only ever sees age (``kind="regression"``). The asymmetric
-    test objective lives entirely in ``metrics``, which reaches into the
-    diagnosis column via ``test_idx``.
-    """
+    """Train age regression on controls, then evaluate age prediction on controls and cases."""
 
     name: str
     data: HFDataset
@@ -47,10 +41,13 @@ class BrainAgeGapTask:
 
         yield train_controls, np.concatenate([test_controls, cases])
 
-    def metrics(self, y_true: np.ndarray, y_pred: np.ndarray, test_idx: np.ndarray) -> dict:
-        gap = (y_pred - y_true).reshape(-1)
-        dx = np.asarray(self.data[self.dx_column])[test_idx]
-        case_gap = gap[dx == self.case_label]
-        control_gap = gap[dx == self.control_label]
-        test = stats.ttest_ind(case_gap, control_gap)
-        return {"bag_tstat": float(test.statistic)}
+    def metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        test_idx: np.ndarray,
+        y_score: np.ndarray | None = None,
+    ) -> dict:
+        return {
+            "pearson_r": pearson_r(y_true, y_pred),
+        }
