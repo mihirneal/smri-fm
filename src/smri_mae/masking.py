@@ -130,11 +130,12 @@ def block_patch_mask(
     valid_patch_mask: Tensor,
     grid_size: tuple[int, int, int],
     mask_ratio: float,
-    block_fraction: float,
-    block_size_min: int | Sequence[int],
-    block_size_max: int | Sequence[int],
+    block_fraction: float = 0.7,
+    block_size_min: int | Sequence[int] = 2,
+    block_size_max: int | Sequence[int] = 6,
     generator: torch.Generator | None = None,
-) -> Tensor:
+    return_block_mask: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """
     Select visible patches after mixed block and random masking.
 
@@ -149,6 +150,8 @@ def block_patch_mask(
 
     block_size_min = to_3tuple(block_size_min)
     block_size_max = to_3tuple(block_size_max)
+    if any(min_size <= 0 for min_size in block_size_min):
+        raise ValueError(f"block_size_min {block_size_min} must be positive")
     if any(min_size > max_size for min_size, max_size in zip(block_size_min, block_size_max)):
         raise ValueError(
             f"block_size_min {block_size_min} must not exceed block_size_max {block_size_max}"
@@ -170,10 +173,17 @@ def block_patch_mask(
         target_hidden.to(torch.float64) * block_fraction
     ).to(torch.long)
     if not target_hidden.any():
+        block_hidden = torch.zeros_like(valid_patch_mask)
+        if return_block_mask:
+            return valid_patch_mask, block_hidden
         return valid_patch_mask
     if not target_block_hidden.any():
         hidden = _random_mask_subset(valid_patch_mask, target_hidden, generator=generator)
-        return valid_patch_mask & ~hidden
+        block_hidden = torch.zeros_like(valid_patch_mask)
+        visible = valid_patch_mask & ~hidden
+        if return_block_mask:
+            return visible, block_hidden
+        return visible
 
     device = valid_patch_mask.device
     grid_axes = torch.meshgrid(
@@ -270,9 +280,13 @@ def block_patch_mask(
         if complete.all():
             break
 
+    block_hidden = hidden.clone()
     remaining = (target_hidden - hidden.sum(dim=1)).clamp(min=0)
     if remaining.any():
         fallback_candidates = valid_patch_mask & ~hidden
         hidden |= _random_mask_subset(fallback_candidates, remaining, generator=generator)
 
-    return valid_patch_mask & ~hidden
+    visible = valid_patch_mask & ~hidden
+    if return_block_mask:
+        return visible, block_hidden
+    return visible

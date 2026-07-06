@@ -201,6 +201,7 @@ class MaskedEncoder(nn.Module):
         Tensor | None,
         Int[Tensor, "B L"] | None,
         Tensor | None,
+        Tensor | None,
     ]:
         """
         x: input data shape [B, C, D, H, W] 
@@ -241,20 +242,24 @@ class MaskedEncoder(nn.Module):
         # patch and position embed
         x = self.patch_embed(x)
         x = self.pos_embed(x)
+        block_hidden_mask = None
 
         if mask is not None or mask_ratio is not None:
             mask_ratio = 0.0 if mask_ratio is None else mask_ratio
             token_mask = None
 
             if masking_strategy == "block":
-                patch_mask = block_patch_mask(
+                patch_mask, block_patch_hidden = block_patch_mask(
                     patch_mask,
                     grid_size=self.patchify.grid_size,
                     mask_ratio=mask_ratio,
                     block_fraction=block_mask_fraction,
                     block_size_min=block_mask_min_size,
                     block_size_max=block_mask_max_size,
+                    return_block_mask=True,
                 )
+                block_hidden_patches = block_patch_hidden.unsqueeze(-1).expand(-1, -1, P)
+                block_hidden_mask = self.patchify.unpatchify(block_hidden_patches)
                 if masking_policy == "per_sample_pad":
                     mask_ids, token_mask = patch_ids_from_mask(patch_mask)
                 elif masking_policy == "batch_min":
@@ -295,7 +300,15 @@ class MaskedEncoder(nn.Module):
             token_mask=token_mask,
         )
         if return_token_mask:
-            return cls_embeds, reg_embeds, patch_embeds, mask, mask_ids, token_mask
+            return (
+                cls_embeds,
+                reg_embeds,
+                patch_embeds,
+                mask,
+                mask_ids,
+                token_mask,
+                block_hidden_mask,
+            )
         return cls_embeds, reg_embeds, patch_embeds, mask, mask_ids
 
     def forward_patch_embeds(
@@ -849,6 +862,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             visible_mask,
             visible_ids,
             visible_token_mask,
+            block_hidden_mask,
         ) = self.encoder(
             images,
             mask=visible_mask,
@@ -906,6 +920,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             "visible_mask": visible_mask,
             "visible_ids": visible_ids,
             "visible_token_mask": visible_token_mask,
+            "block_hidden_mask": block_hidden_mask,
             "pred_mask": pred_mask,
             "pred_ids": pred_ids,
             "pred_token_mask": pred_token_mask,

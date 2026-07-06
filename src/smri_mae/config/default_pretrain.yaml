@@ -20,8 +20,6 @@ masking_strategy: block
 block_mask_fraction: 0.70
 block_mask_min_size: 2
 block_mask_max_size: 6
-fig_kwargs:
-  mask_style: boxes
 
 # Model.
 model: mae_vit_large

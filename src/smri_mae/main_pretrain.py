@@ -170,7 +170,8 @@ def main(args: DictConfig):
         eval_stats = {}
         eval_plots = {}
         eval_period = args.get("eval_period", 1)
-        if eval_period and (epoch % eval_period == 0 or epoch == args.epochs - 1):
+        completed_epoch = epoch + 1
+        if eval_period and (completed_epoch % eval_period == 0 or epoch == args.epochs - 1):
             for name, loader in eval_loaders.items():
                 stats, plots = evaluate(
                     args,
@@ -459,6 +460,7 @@ def make_plots(
         pred=state["pred_images"],
         visible_mask=state["visible_mask"],
         pred_mask=state["pred_mask"],
+        block_mask=state.get("block_hidden_mask"),
         img_mask=img_mask,
         patch_size=args.patch_size,
         raw_mean=raw_mean,
