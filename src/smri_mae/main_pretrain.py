@@ -301,7 +301,6 @@ def train_one_epoch(
             batch["image_values"],
             batch["img_mask"],
             (int(args.get("in_chans", 1)), *args.img_size),
-            image_quantization=batch.get("image_quantization"),
             dtype=amp_dtype,
         )
 
@@ -399,7 +398,6 @@ def evaluate(
             batch["image_values"],
             batch["img_mask"],
             (int(args.get("in_chans", 1)), *args.img_size),
-            image_quantization=batch.get("image_quantization"),
             dtype=amp_dtype,
         )
 
