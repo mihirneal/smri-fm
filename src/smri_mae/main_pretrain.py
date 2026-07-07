@@ -36,10 +36,6 @@ DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
 MODELS_DICT = models_mae.__dict__
 
 
-def masking_policy_from_config(args: DictConfig) -> str:
-    return "per_sample_pad" if args.get("per_sample_pad", False) else "batch_min"
-
-
 def main(args: DictConfig):
     # setup
     ut.init_distributed_mode(args)
@@ -264,6 +260,7 @@ def train_one_epoch(
 
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
+    masking_policy = "per_sample_pad" if args.get("per_sample_pad", False) else "batch_min"
 
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
@@ -300,7 +297,7 @@ def train_one_epoch(
                 img_mask=img_mask,
                 mask_ratio=args.mask_ratio,
                 pred_mask_ratio=args.pred_mask_ratio,
-                masking_policy=masking_policy_from_config(args),
+                masking_policy=masking_policy,
                 with_state=False,
             )
 
@@ -371,6 +368,7 @@ def evaluate(
     num_batches = epoch_num_batches if not args.debug else 10
     num_batches = min(num_batches, epoch_num_batches)
     example_step = random.randint(1, num_batches)
+    masking_policy = "per_sample_pad" if args.get("per_sample_pad", False) else "batch_min"
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
     if use_cuda and args.presend_cuda:
@@ -397,7 +395,7 @@ def evaluate(
                 img_mask=img_mask,
                 mask_ratio=args.mask_ratio,
                 pred_mask_ratio=args.pred_mask_ratio,
-                masking_policy=masking_policy_from_config(args),
+                masking_policy=masking_policy,
             )
 
         metric_logger.update(loss=loss)
