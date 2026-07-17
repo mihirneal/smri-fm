@@ -62,3 +62,33 @@ The default SynthSeg backend is:
 ```bash
 uvx --python 3.11 --from 'git+https://github.com/MedARC-AI/SynthSeg.git' SynthSeg
 ```
+
+## Masked-anatomy pretraining targets
+
+Masked-anatomy pretraining keeps MAE-style patch masking but replaces image
+reconstruction with prediction of the SynthSeg label distribution in each
+hidden patch. The provided vocabulary contains the 98 non-background hard
+labels produced by SynthSeg 2.0 with `--parc`.
+
+After the base sparse-image shards and SynthSeg derivatives exist, create
+augmented shards:
+
+```bash
+uv run python scripts/add_masked_anatomy_targets.py \
+  'datasets/FOMO_with_dwi/shard.{000000..001800}.tar' \
+  --output-dir datasets/FOMO_with_dwi_anatomy \
+  --source-root /path/to/FOMO300 \
+  --patch-size 8 \
+  --img-size 208 240 208
+```
+
+Each sample receives an `anatomy.npz` member containing compressed
+`[num_patches, 98]` voxel counts. Train with:
+
+```bash
+uv run python src/smri_mae/main_pretrain.py \
+  --cfg-path src/smri_mae/config/masked_anatomy_pretrain.yaml \
+  --overrides \
+  datasets.fomo_train.url='datasets/FOMO_with_dwi_anatomy/shard.{000000..001620}.tar' \
+  datasets.fomo_val.url='datasets/FOMO_with_dwi_anatomy/shard.{001621..001800}.tar'
+```

@@ -877,10 +877,207 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         model_kwargs = {k: args[k] for k in ["img_size", "in_chans", "patch_size"] if k in args}
         model_kwargs.update(args["model_kwargs"] or {})
         model_kwargs.update(kwargs)
-        model_fn = MODELS_DICT[args["model"]]
+        try:
+            model_fn = globals()[args["model"]]
+        except KeyError as exc:
+            raise ValueError(f"unknown checkpoint model {args['model']!r}") from exc
         model = model_fn(**model_kwargs)
         model.load_state_dict(ckpt["model"])
         return model
+
+
+class MaskedAnatomyViT(MaskedAutoencoderViT):
+    """
+    MAE-style masked prediction with SynthSeg anatomy targets.
+
+    The encoder masking and lightweight decoder are identical to MAE, but the
+    decoder predicts a class distribution for each hidden patch. Targets are
+    per-patch SynthSeg voxel counts, so this objective has no image
+    reconstruction loss.
+    """
+
+    def __init__(
+        self,
+        num_anatomy_classes: int,
+        **kwargs,
+    ):
+        if num_anatomy_classes <= 1:
+            raise ValueError(
+                f"num_anatomy_classes must be greater than 1, got {num_anatomy_classes}"
+            )
+
+        target_norm = kwargs.pop("target_norm", None)
+        if target_norm not in {None, "none"}:
+            raise ValueError("target_norm is only defined for image-reconstruction MAE")
+
+        super().__init__(target_norm=None, **kwargs)
+        self.num_anatomy_classes = int(num_anatomy_classes)
+
+        decoder_embed_dim = self.decoder.mask_token.shape[-1]
+        self.decoder.head = nn.Linear(decoder_embed_dim, self.num_anatomy_classes)
+        self.decoder.head.apply(_init_weights)
+
+    def extra_repr(self):
+        parent = super().extra_repr()
+        return f"{parent}, num_anatomy_classes={self.num_anatomy_classes}"
+
+    def validate_anatomy_counts(self, anatomy_counts: Tensor, batch_size: int) -> None:
+        expected = (
+            batch_size,
+            self.pred_patchify.num_patches,
+            self.num_anatomy_classes,
+        )
+        if anatomy_counts.ndim != 3 or tuple(anatomy_counts.shape) != expected:
+            raise ValueError(
+                "anatomy_counts must have shape "
+                f"(B, num_patches, num_anatomy_classes)={expected}, "
+                f"got {tuple(anatomy_counts.shape)}"
+            )
+        if anatomy_counts.is_floating_point():
+            if not torch.isfinite(anatomy_counts).all():
+                raise ValueError("anatomy_counts contains non-finite values")
+        if (anatomy_counts < 0).any():
+            raise ValueError("anatomy_counts must be non-negative")
+
+    def forward_anatomy_loss(
+        self,
+        preds: Float[Tensor, "B Q C"],
+        anatomy_counts: Tensor,
+        pred_ids: Int[Tensor, "B Q"],
+        pred_token_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Multinomial cross-entropy over SynthSeg-labelled voxels in hidden patches.
+
+        Accumulation is explicitly float32 under autocast. The loss is normalized
+        per subject before averaging, matching the existing MAE loss semantics.
+        """
+        C = self.num_anatomy_classes
+        gather_ids = pred_ids.unsqueeze(-1).expand(-1, -1, C)
+        target_counts = anatomy_counts.gather(1, gather_ids).float()
+
+        if pred_token_mask is not None:
+            target_counts = target_counts * pred_token_mask.unsqueeze(-1)
+
+        log_probs = torch.log_softmax(preds.float(), dim=-1)
+        per_subject_nll = -(target_counts * log_probs).sum(dim=(1, 2))
+        per_subject_count = target_counts.sum(dim=(1, 2))
+        if (per_subject_count <= 0).any():
+            raise ValueError("each subject must have at least one labelled hidden-patch voxel")
+        return (per_subject_nll / per_subject_count).mean()
+
+    @torch.no_grad()
+    def forward_anatomy_labels(
+        self,
+        preds: Float[Tensor, "B Q C"],
+        anatomy_counts: Tensor,
+        pred_ids: Int[Tensor, "B Q"],
+        pred_token_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Return compact full-grid target and hidden-patch prediction labels."""
+        target_mass = anatomy_counts.sum(dim=-1)
+        target_labels = anatomy_counts.to(dtype=torch.int32).argmax(dim=-1)
+        target_labels = target_labels.masked_fill(target_mass <= 0, -1).to(dtype=torch.int16)
+
+        pred_values = preds.argmax(dim=-1).to(dtype=torch.long) + 1
+        if pred_token_mask is not None:
+            pred_values = pred_values * pred_token_mask
+        full_pred_values = torch.zeros(
+            (preds.shape[0], self.pred_patchify.num_patches),
+            dtype=torch.long,
+            device=preds.device,
+        )
+        full_pred_values.scatter_reduce_(
+            1,
+            pred_ids,
+            pred_values,
+            reduce="amax",
+            include_self=True,
+        )
+        pred_labels = (full_pred_values - 1).to(dtype=torch.int16)
+        return target_labels, pred_labels
+
+    def forward(
+        self,
+        images: Tensor,
+        img_mask: Tensor,
+        anatomy_counts: Tensor,
+        mask_ratio: float,
+        pred_mask_ratio: float | None = None,
+        masking_policy: MaskingPolicy = "batch_min",
+        with_state: bool = True,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
+        self.validate_anatomy_counts(anatomy_counts, images.shape[0])
+        anatomy_counts = anatomy_counts.to(device=images.device)
+
+        img_mask, visible_mask, pred_mask = self.prepare_masks(
+            img_mask,
+            None,
+            None,
+            device=images.device,
+        )
+
+        (
+            cls_embeds,
+            reg_embeds,
+            patch_embeds,
+            visible_mask,
+            visible_ids,
+            visible_token_mask,
+        ) = self.encoder(
+            images,
+            mask=visible_mask,
+            mask_ratio=mask_ratio,
+            masking_policy=masking_policy,
+        )
+
+        pred_mask_patches, pred_ids, pred_token_mask = self.prepare_pred_mask(
+            visible_mask,
+            pred_mask=pred_mask,
+            pred_mask_ratio=pred_mask_ratio,
+            masking_policy=masking_policy,
+        )
+
+        preds = self.forward_decoder(
+            patch_embeds,
+            reg_embeds,
+            visible_ids,
+            pred_ids,
+            visible_token_mask=visible_token_mask,
+            pred_token_mask=pred_token_mask,
+        )
+        loss = self.forward_anatomy_loss(
+            preds,
+            anatomy_counts,
+            pred_ids,
+            pred_token_mask=pred_token_mask,
+        )
+
+        if not with_state:
+            return loss
+
+        target_anatomy_labels, pred_anatomy_labels = self.forward_anatomy_labels(
+            preds,
+            anatomy_counts,
+            pred_ids,
+            pred_token_mask=pred_token_mask,
+        )
+        pred_mask = self.pred_patchify.unpatchify(pred_mask_patches)
+        state = {
+            "patch_embeds": patch_embeds,
+            "cls_embeds": cls_embeds,
+            "reg_embeds": reg_embeds,
+            "visible_mask": visible_mask,
+            "visible_ids": visible_ids,
+            "visible_token_mask": visible_token_mask,
+            "pred_mask": pred_mask,
+            "pred_ids": pred_ids,
+            "pred_token_mask": pred_token_mask,
+            "preds": preds,
+            "target_anatomy_labels": target_anatomy_labels,
+            "pred_anatomy_labels": pred_anatomy_labels,
+        }
+        return loss, state
 
 
 class MaskedViT(MaskedEncoder, PyTorchModelHubMixin):
@@ -942,20 +1139,33 @@ class MaskedViT(MaskedEncoder, PyTorchModelHubMixin):
         x: Tensor,
         mask: Tensor | None = None,
         mask_ratio: float | None = None,
+        masking_policy: MaskingPolicy = "batch_min",
     ):
         if mask is not None:
             mask = mask.to(device=x.device, dtype=x.dtype)
-        return super().forward(x, mask=mask, mask_ratio=mask_ratio)
+        return super().forward(
+            x,
+            mask=mask,
+            mask_ratio=mask_ratio,
+            masking_policy=masking_policy,
+        )
 
     def forward_embedding(
         self,
         x: Tensor,
         mask: Tensor | None = None,
         mask_ratio: float | None = None,
+        masking_policy: MaskingPolicy = "batch_min",
     ):
         if mask is not None:
             mask = mask.to(device=x.device, dtype=x.dtype)
-        return super().forward_embedding(x, mask=mask, mask_ratio=mask_ratio)
+        cls_embeds, reg_embeds, patch_embeds, *_ = self.forward(
+            x,
+            mask=mask,
+            mask_ratio=mask_ratio,
+            masking_policy=masking_policy,
+        )
+        return cls_embeds, reg_embeds, patch_embeds
 
 
 def _to_3d_tuple(value: int | Sequence[int], name: str) -> tuple[int, int, int]:
@@ -988,6 +1198,19 @@ def _create_vit(**kwargs):
 def _create_mae_vit(**kwargs):
     kwargs = filter_kwargs(MaskedAutoencoderViT, kwargs)
     model = MaskedAutoencoderViT(**kwargs)
+    return model
+
+
+def _create_masked_anatomy_vit(**kwargs):
+    try:
+        num_anatomy_classes = kwargs.pop("num_anatomy_classes")
+    except KeyError as exc:
+        raise TypeError("num_anatomy_classes is required for masked anatomy models") from exc
+    kwargs = filter_kwargs(MaskedAutoencoderViT, kwargs)
+    model = MaskedAnatomyViT(
+        num_anatomy_classes=num_anatomy_classes,
+        **kwargs,
+    )
     return model
 
 
@@ -1039,6 +1262,26 @@ def mae_vit_large(**kwargs):
 def mae_vit_huge(**kwargs):
     model_args = dict(embed_dim=1280, depth=32, num_heads=16)
     return _create_mae_vit(**model_args, **kwargs)
+
+
+def masked_anatomy_vit_small(**kwargs):
+    model_args = dict(embed_dim=384, depth=12, num_heads=6)
+    return _create_masked_anatomy_vit(**model_args, **kwargs)
+
+
+def masked_anatomy_vit_base(**kwargs):
+    model_args = dict(embed_dim=768, depth=12, num_heads=12)
+    return _create_masked_anatomy_vit(**model_args, **kwargs)
+
+
+def masked_anatomy_vit_large(**kwargs):
+    model_args = dict(embed_dim=1024, depth=24, num_heads=16)
+    return _create_masked_anatomy_vit(**model_args, **kwargs)
+
+
+def masked_anatomy_vit_huge(**kwargs):
+    model_args = dict(embed_dim=1280, depth=32, num_heads=16)
+    return _create_masked_anatomy_vit(**model_args, **kwargs)
 
 
 # "patch embed" baseline model, depth 0 ViT (hah)

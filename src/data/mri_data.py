@@ -23,6 +23,21 @@ def collate(
     ]
     batch["image_values"] = torch.cat(image_values)
 
+    has_anatomy = ["anatomy_counts" in sample for sample in samples]
+    if any(has_anatomy) and not all(has_anatomy):
+        raise ValueError("anatomy_counts must be present for every sample in a batch")
+    if all(has_anatomy):
+        anatomy_counts = [np.asarray(sample["anatomy_counts"]) for sample in samples]
+        shapes = {counts.shape for counts in anatomy_counts}
+        if len(shapes) != 1:
+            raise ValueError(f"anatomy_counts shapes differ within a batch: {sorted(shapes)}")
+        max_count = max(int(counts.max(initial=0)) for counts in anatomy_counts)
+        if max_count > torch.iinfo(torch.int16).max:
+            raise ValueError(f"anatomy patch count {max_count} does not fit in int16")
+        batch["anatomy_counts"] = torch.stack(
+            [torch.as_tensor(counts.copy(), dtype=torch.int16) for counts in anatomy_counts]
+        )
+
     if include_meta:
         batch["meta"] = [make_collatable(sample["meta"]) for sample in samples]
     return batch
@@ -111,12 +126,45 @@ def warn_and_continue(exn):
     return True
 
 
-def extract_sparse_wds_sample(sample: dict) -> dict:
-    return {
+def extract_sparse_wds_sample(
+    sample: dict,
+    *,
+    anatomy_key: str | None = None,
+    expected_anatomy_label_values: Sequence[int] | None = None,
+) -> dict:
+    extracted = {
         "image_values": np.asarray(sample["image_values.npy"], dtype=np.float16),
         "img_mask": np.asarray(sample["img_mask.npy"], dtype=np.uint8),
         "meta": sample["meta.json"],
     }
+    if anatomy_key is not None:
+        anatomy = sample[anatomy_key]
+        embedded_label_values = None
+        if isinstance(anatomy, dict):
+            embedded_label_values = anatomy.get("label_values")
+            try:
+                anatomy = anatomy["counts"]
+            except KeyError as exc:
+                raise KeyError(f"{anatomy_key!r} must contain a 'counts' array") from exc
+        anatomy = np.asarray(anatomy)
+        if anatomy.ndim != 2:
+            raise ValueError(
+                f"{anatomy_key!r} must decode to a [num_patches, num_classes] array, "
+                f"got shape {anatomy.shape}"
+            )
+        if expected_anatomy_label_values is not None:
+            if embedded_label_values is None:
+                raise KeyError(
+                    f"{anatomy_key!r} must embed label_values when a vocabulary is configured"
+                )
+            expected = np.asarray(expected_anatomy_label_values, dtype=np.int64)
+            embedded = np.asarray(embedded_label_values, dtype=np.int64)
+            if not np.array_equal(embedded, expected):
+                raise ValueError(
+                    f"{anatomy_key!r} label_values do not match the configured vocabulary"
+                )
+        extracted["anatomy_counts"] = anatomy
+    return extracted
 
 
 def make_sparse_wds_dataset(
@@ -124,6 +172,8 @@ def make_sparse_wds_dataset(
     *,
     shuffle: bool,
     buffer_size: int,
+    anatomy_key: str | None = None,
+    expected_anatomy_label_values: Sequence[int] | None = None,
 ) -> wds.WebDataset:
     dataset = wds.WebDataset(
         expand_urls(url),
@@ -132,7 +182,12 @@ def make_sparse_wds_dataset(
         shardshuffle=False,
         nodesplitter=wds.split_by_node,
     )
-    dataset = dataset.decode().map(extract_sparse_wds_sample, handler=warn_and_continue)
+    extractor = partial(
+        extract_sparse_wds_sample,
+        anatomy_key=anatomy_key,
+        expected_anatomy_label_values=expected_anatomy_label_values,
+    )
+    dataset = dataset.decode().map(extractor, handler=warn_and_continue)
     if shuffle:
         dataset = dataset.shuffle(buffer_size)
     return dataset

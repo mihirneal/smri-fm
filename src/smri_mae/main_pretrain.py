@@ -27,6 +27,7 @@ from matplotlib import pyplot as plt
 from torch import Tensor
 
 import data.mri_data as mri_data
+import data.anatomy_targets as anatomy_targets
 import smri_mae.model_mae as models_mae
 import smri_mae.utils as ut
 import smri_mae.visualization as vis
@@ -191,6 +192,23 @@ def main(args: DictConfig):
 def create_data_loaders(args: DictConfig):
     data_loaders = {}
     dataset_names = [args.train_dataset] + args.eval_datasets
+    expected_anatomy_label_values = None
+    if args.get("objective", "mae") == "masked_anatomy":
+        vocabulary_path = args.get("anatomy_vocabulary")
+        if not vocabulary_path:
+            raise ValueError("masked_anatomy requires anatomy_vocabulary in the config")
+        vocabulary = anatomy_targets.load_anatomy_vocabulary(vocabulary_path)
+        expected_anatomy_label_values = vocabulary.values
+        configured_classes = int(args.model_kwargs.num_anatomy_classes)
+        if configured_classes != vocabulary.num_classes:
+            raise ValueError(
+                f"model has {configured_classes} anatomy classes but vocabulary "
+                f"{vocabulary.name!r} has {vocabulary.num_classes}"
+            )
+        print(
+            f"anatomy vocabulary: {vocabulary.name} "
+            f"({vocabulary.num_classes} non-background classes)"
+        )
 
     for dataset_name in dataset_names:
         dataset_config = args.datasets[dataset_name].copy()
@@ -200,10 +218,13 @@ def create_data_loaders(args: DictConfig):
         print(f"loading dataset: {dataset_name}\n\n{OmegaConf.to_yaml(dataset_config)}")
         shuffle = dataset_config["shuffle"]
         samples_per_epoch = dataset_config.pop("samples_per_epoch")
+        anatomy_key = dataset_config.pop("anatomy_key", None)
         dataset = mri_data.make_sparse_wds_dataset(
             dataset_config["url"],
             shuffle=shuffle,
             buffer_size=dataset_config["buffer_size"],
+            anatomy_key=anatomy_key,
+            expected_anatomy_label_values=expected_anatomy_label_values,
         )
         num_workers = int(args.num_workers)
         loader_kwargs = {
@@ -235,6 +256,37 @@ def sync_checkpoints_to_r2(args: DictConfig, output_dir: Path) -> None:
     cmd = ["aws", "s3", "sync", str(output_dir), str(r2_sync_url), "--profile", "r2"]
     print(f"syncing checkpoints to R2: {output_dir} -> {r2_sync_url}")
     subprocess.run(cmd, check=True)
+
+
+def forward_pretrain_model(
+    args: DictConfig,
+    model: nn.Module,
+    batch: dict[str, Tensor],
+    images: Tensor,
+    img_mask: Tensor,
+    *,
+    masking_policy: str,
+    with_state: bool,
+):
+    objective = args.get("objective", "mae")
+    forward_kwargs = {
+        "img_mask": img_mask,
+        "mask_ratio": args.mask_ratio,
+        "pred_mask_ratio": args.pred_mask_ratio,
+        "masking_policy": masking_policy,
+        "with_state": with_state,
+    }
+    if objective == "masked_anatomy":
+        try:
+            forward_kwargs["anatomy_counts"] = batch["anatomy_counts"]
+        except KeyError as exc:
+            raise KeyError(
+                "masked_anatomy requires dataset anatomy targets; set "
+                "datasets.<name>.anatomy_key (normally 'anatomy.npz')"
+            ) from exc
+    elif objective != "mae":
+        raise ValueError(f"unknown pretraining objective {objective!r}")
+    return model(images, **forward_kwargs)
 
 
 def train_one_epoch(
@@ -292,11 +344,12 @@ def train_one_epoch(
         )
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
+            loss = forward_pretrain_model(
+                args,
+                model,
+                batch,
                 images,
-                img_mask=img_mask,
-                mask_ratio=args.mask_ratio,
-                pred_mask_ratio=args.pred_mask_ratio,
+                img_mask,
                 masking_policy=masking_policy,
                 with_state=False,
             )
@@ -390,18 +443,32 @@ def evaluate(
         )
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss, state = model(
+            loss, state = forward_pretrain_model(
+                args,
+                model,
+                batch,
                 images,
-                img_mask=img_mask,
-                mask_ratio=args.mask_ratio,
-                pred_mask_ratio=args.pred_mask_ratio,
+                img_mask,
                 masking_policy=masking_policy,
+                with_state=True,
             )
 
         metric_logger.update(loss=loss)
 
         if is_master and batch_step == example_step:
-            example_batch = {**batch, "image": images, "img_mask": img_mask}
+            example_batch = {
+                key: value for key, value in batch.items() if key != "anatomy_counts"
+            }
+            example_batch.update({"image": images, "img_mask": img_mask})
+            if args.get("objective", "mae") == "masked_anatomy":
+                state = {
+                    key: state[key]
+                    for key in (
+                        "pred_mask",
+                        "target_anatomy_labels",
+                        "pred_anatomy_labels",
+                    )
+                }
             example_data = {
                 "batch": ut.send_data(example_batch, "cpu"),
                 "state": ut.send_data(state, "cpu"),
@@ -439,9 +506,33 @@ def make_plots(
     if img_mask is not None:
         img_mask = img_mask.expand_as(images)
 
-    raw_mean, raw_std = vis.raw_stats_from_batch(batch)
-
     plots = {}
+    if args.get("objective", "mae") == "masked_anatomy":
+        target = vis.patch_labels_to_volume(
+            state["target_anatomy_labels"].long() + 1,
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+        )
+        pred = vis.patch_labels_to_volume(
+            state["pred_anatomy_labels"].long() + 1,
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+        )
+        plot_kwargs = ut.filter_kwargs(vis.plot_mask_pred, fig_kwargs)
+        plot_kwargs.setdefault("cmap", "turbo")
+        anatomy_fig = vis.plot_mask_pred(
+            target=target,
+            pred=pred,
+            pred_mask=state["pred_mask"],
+            img_mask=img_mask,
+            patch_size=args.patch_size,
+            **plot_kwargs,
+        )
+        plots["masked_anatomy"] = vis.fig2pil(anatomy_fig)
+        plt.close(anatomy_fig)
+        return plots
+
+    raw_mean, raw_std = vis.raw_stats_from_batch(batch)
     mask_pred_fig = vis.plot_mask_pred(
         target=images,
         pred=state["pred_images"],

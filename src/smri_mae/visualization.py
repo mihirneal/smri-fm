@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from io import BytesIO
 
 import torch
@@ -43,6 +43,36 @@ def raw_stats_from_batch(batch: dict) -> tuple[Tensor | None, Tensor | None]:
         means.append(float(mean))
         stds.append(float(std))
     return torch.tensor(means), torch.tensor(stds)
+
+
+def patch_labels_to_volume(
+    labels: Tensor,
+    img_size: int | Sequence[int],
+    patch_size: int | Sequence[int],
+) -> Tensor:
+    """Expand flattened patch labels into a piecewise-constant 3D volume."""
+    img_size = _as_3tuple(img_size)
+    patch_size = _as_3tuple(patch_size)
+    if any(size % patch != 0 for size, patch in zip(img_size, patch_size)):
+        raise ValueError(f"img_size {img_size} must be divisible by patch_size {patch_size}")
+
+    if labels.ndim == 1:
+        labels = labels.unsqueeze(0)
+    if labels.ndim != 2:
+        raise ValueError(f"expected patch labels with shape [B, N], got {tuple(labels.shape)}")
+
+    grid_size = tuple(size // patch for size, patch in zip(img_size, patch_size))
+    expected_patches = grid_size[0] * grid_size[1] * grid_size[2]
+    if labels.shape[1] != expected_patches:
+        raise ValueError(
+            f"expected {expected_patches} patch labels for grid {grid_size}, "
+            f"got {labels.shape[1]}"
+        )
+
+    volume = labels.reshape(labels.shape[0], *grid_size)
+    for dim, repeats in enumerate(patch_size, start=1):
+        volume = volume.repeat_interleave(repeats, dim=dim)
+    return volume.unsqueeze(1)
 
 
 def plot_mask_pred(
@@ -300,7 +330,7 @@ def _content_crop(mask: Tensor, patch_size: tuple[int, int]) -> tuple[slice, sli
     return slice(row0, row1), slice(col0, col1)
 
 
-def _as_3tuple(value: int | tuple[int, int, int]) -> tuple[int, int, int]:
+def _as_3tuple(value: int | Sequence[int]) -> tuple[int, int, int]:
     if isinstance(value, int):
         return (value, value, value)
     if len(value) != 3:

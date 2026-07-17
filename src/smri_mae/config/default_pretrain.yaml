@@ -18,6 +18,7 @@ pred_mask_ratio: null
 per_sample_pad: true
 
 # Model.
+objective: mae
 model: mae_vit_large
 model_kwargs:
   # decoding mode: attn, cross, or crossreg.
