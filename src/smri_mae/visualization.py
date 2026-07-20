@@ -78,7 +78,6 @@ def patch_labels_to_volume(
 def plot_mask_pred(
     target: Tensor,
     pred: Tensor,
-    visible_mask: Tensor | None = None,
     pred_mask: Tensor | None = None,
     img_mask: Tensor | None = None,
     sample_idx: int = 0,
@@ -92,8 +91,6 @@ def plot_mask_pred(
     raw_mean: float | Tensor | None = None,
     raw_std: float | Tensor | None = None,
 ):
-    del visible_mask
-
     target_vol = _select_volume(target, sample_idx=sample_idx, channel_idx=channel_idx)
     pred_vol = _select_volume(pred, sample_idx=sample_idx, channel_idx=channel_idx)
     if raw_mean is not None and raw_std is not None:
@@ -213,28 +210,6 @@ def _select_scalar(value: float | Tensor, sample_idx: int = 0) -> float:
             value = value.reshape(-1)[sample_idx]
         return float(value)
     return float(value)
-
-
-def _central_slice(
-    x: Tensor,
-    sample_idx: int = 0,
-    channel_idx: int = 0,
-    slice_idx: int | None = None,
-) -> Tensor:
-    x = x.detach().float().cpu()
-    if x.ndim == 5:
-        depth = x.shape[2]
-        slice_idx = depth // 2 if slice_idx is None else slice_idx
-        return x[sample_idx, channel_idx, slice_idx]
-    if x.ndim == 4:
-        return x[sample_idx, channel_idx]
-    if x.ndim == 3:
-        depth = x.shape[0]
-        slice_idx = depth // 2 if slice_idx is None else slice_idx
-        return x[slice_idx]
-    if x.ndim == 2:
-        return x
-    raise ValueError(f"expected a 2D image or 3D volume tensor, got shape {tuple(x.shape)}")
 
 
 def _prediction_composite(target: Tensor, pred: Tensor, pred_mask: Tensor) -> Tensor:

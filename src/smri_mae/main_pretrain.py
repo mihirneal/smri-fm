@@ -12,7 +12,9 @@ import math
 import random
 import subprocess
 import time
+from contextlib import nullcontext
 from functools import partial
+from itertools import islice
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -44,6 +46,7 @@ def main(args: DictConfig):
     is_master = global_rank == 0
     world_size = ut.get_world_size()
     device = torch.device(args.device)
+    ut.configure_flash_sdpa()
     ut.random_seed(args.seed, rank=global_rank)
 
     if args.name and not args.output_dir.endswith(args.name):
@@ -93,11 +96,12 @@ def main(args: DictConfig):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            gradient_as_bucket_view=True,
+        )
         model_without_ddp = model.module
-
-    if args.compile:
-        model = torch.compile(model)
 
     # optimizer
     total_batch_size = args.batch_size * args.accum_iter * world_size
@@ -120,7 +124,7 @@ def main(args: DictConfig):
     optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=True)
 
     epoch_num_batches = len(train_loader)
-    steps_per_epoch = epoch_num_batches // args.accum_iter
+    steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
     lr_schedule = ut.WarmupThenCosine(
@@ -265,7 +269,6 @@ def forward_pretrain_model(
     images: Tensor,
     img_mask: Tensor,
     *,
-    masking_policy: str,
     with_state: bool,
 ):
     objective = args.get("objective", "mae")
@@ -273,7 +276,7 @@ def forward_pretrain_model(
         "img_mask": img_mask,
         "mask_ratio": args.mask_ratio,
         "pred_mask_ratio": args.pred_mask_ratio,
-        "masking_policy": masking_policy,
+        "pad_to_multiple": args.pad_to_multiple,
         "with_state": with_state,
     }
     if objective == "masked_anatomy":
@@ -308,12 +311,10 @@ def train_one_epoch(
     log_wandb = args.wandb and ut.is_main_process()
 
     epoch_num_batches = len(data_loader)
-    steps_per_epoch = epoch_num_batches // args.accum_iter
+    steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
 
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
-    masking_policy = "per_sample_pad" if args.get("per_sample_pad", False) else "batch_min"
-
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
     if use_cuda and args.presend_cuda:
@@ -329,10 +330,11 @@ def train_one_epoch(
 
         batch_step = batch_idx + 1
         log_step = batch_step % print_freq == 0 or batch_step == num_batches
-        global_step = epoch * steps_per_epoch + batch_step // args.accum_iter
+        update_in_epoch = batch_idx // args.accum_iter
+        group_size = min(args.accum_iter, num_batches - update_in_epoch * args.accum_iter)
+        need_update = batch_step % args.accum_iter == 0 or batch_step == num_batches
+        global_step = epoch * steps_per_epoch + update_in_epoch
         lr = lr_schedule[global_step]
-        need_update = batch_step % args.accum_iter == 0
-
         if need_update:
             ut.update_lr(optimizer.param_groups, lr)
 
@@ -343,51 +345,40 @@ def train_one_epoch(
             dtype=amp_dtype,
         )
 
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = forward_pretrain_model(
-                args,
-                model,
-                batch,
-                images,
-                img_mask,
-                masking_policy=masking_policy,
-                with_state=False,
-            )
+        sync_context = model.no_sync() if args.distributed and not need_update else nullcontext()
+        with sync_context:
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
+                loss = forward_pretrain_model(
+                    args,
+                    model,
+                    batch,
+                    images,
+                    img_mask,
+                    with_state=False,
+                )
 
-        if log_step:
             loss_for_log = loss.detach()
-            if args.distributed:
-                loss_for_log = loss_for_log.clone()
-                torch.distributed.all_reduce(loss_for_log)
-                loss_for_log /= ut.get_world_size()
+            torch._assert_async(torch.isfinite(loss_for_log), "non-finite loss")
 
-            loss_value = loss_for_log.item()
-            if not math.isfinite(loss_value):
-                raise RuntimeError(f"Loss is {loss_value}, stopping training")
-
-        grad_norm = ut.backward_step(
-            loss / args.accum_iter,
-            optimizer,
-            scaler=loss_scaler,
-            need_update=need_update,
-            max_norm=args.clip_grad,
-        )
+            grad_norm = ut.backward_step(
+                loss / group_size,
+                optimizer,
+                scaler=loss_scaler,
+                need_update=need_update,
+                max_norm=args.clip_grad,
+            )
 
         if need_update and log_step:
+            loss_value = loss_for_log.item()
             grad_norm_value = grad_norm.item()
-            metric_logger.update(
-                loss=loss_value,
-                lr=lr,
-                grad=grad_norm_value,
-            )
+            metric_logger.update(loss=loss_value, lr=lr, grad=grad_norm_value)
             if log_wandb:
-                wandb_stats = {
-                    "train/loss": loss_value,
-                    "train/lr": lr,
-                    "train/grad": grad_norm_value,
-                }
                 wandb.log(
-                    wandb_stats,
+                    {
+                        "train/loss": loss_value,
+                        "train/lr": lr,
+                        "train/grad": grad_norm_value,
+                    },
                     step=int(1000 * (epoch + batch_step / epoch_num_batches)),
                 )
 
@@ -420,15 +411,20 @@ def evaluate(
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
     num_batches = min(num_batches, epoch_num_batches)
-    example_step = random.randint(1, num_batches)
-    masking_policy = "per_sample_pad" if args.get("per_sample_pad", False) else "batch_min"
+    eval_seed = int(args.get("eval_seed", args.seed)) + ut.get_rank()
+    example_step = random.Random(eval_seed).randint(1, num_batches)
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
+    rng_state = ut.capture_rng_state()
+    torch.set_rng_state(torch.Generator().manual_seed(eval_seed).get_state())
+    if use_cuda:
+        torch.cuda.manual_seed(eval_seed)
     if use_cuda and args.presend_cuda:
         data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device, dtype_map={torch.float16: amp_dtype})
 
+    eval_batches = islice(data_loader, num_batches)
     for batch_idx, batch in enumerate(
-        metric_logger.log_every(data_loader, print_freq, header, total_steps=epoch_num_batches)
+        metric_logger.log_every(eval_batches, print_freq, header, total_steps=num_batches)
     ):
         if use_cuda and not args.presend_cuda:
             batch = ut.send_data(batch, device, dtype_map={torch.float16: amp_dtype})
@@ -449,29 +445,37 @@ def evaluate(
                 batch,
                 images,
                 img_mask,
-                masking_policy=masking_policy,
                 with_state=True,
             )
 
-        metric_logger.update(loss=loss)
+        loss_value = loss.detach().float().item()
+        finite = torch.tensor(
+            int(math.isfinite(loss_value)), dtype=torch.int32, device=device
+        )
+        if args.distributed:
+            torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
+        if not finite.item():
+            raise RuntimeError("non-finite validation loss detected")
+        metric_logger.meters["loss"].update(loss_value, n=int(batch["img_mask"].shape[0]))
 
         if is_master and batch_step == example_step:
-            example_batch = {
-                key: value for key, value in batch.items() if key != "anatomy_counts"
-            }
-            example_batch.update({"image": images, "img_mask": img_mask})
+            example_batch = {"image": images[:1], "img_mask": img_mask[:1]}
+            if "meta" in batch:
+                example_batch["meta"] = batch["meta"][:1]
             if args.get("objective", "mae") == "masked_anatomy":
-                state = {
-                    key: state[key]
-                    for key in (
-                        "pred_mask",
-                        "target_anatomy_labels",
-                        "pred_anatomy_labels",
-                    )
+                example_state = {
+                    "pred_mask": state["pred_mask"][:1],
+                    "target_anatomy_labels": state["target_anatomy_labels"][:1],
+                    "pred_anatomy_labels": state["pred_anatomy_labels"][:1],
+                }
+            else:
+                example_state = {
+                    "pred_images": state["pred_images"][:1],
+                    "pred_mask": state["pred_mask"][:1],
                 }
             example_data = {
                 "batch": ut.send_data(example_batch, "cpu"),
-                "state": ut.send_data(state, "cpu"),
+                "state": ut.send_data(example_state, "cpu"),
             }
 
     # gather the stats from all processes
@@ -491,6 +495,7 @@ def evaluate(
             {k: wandb.Image(img, caption=f"example={example_step}") for k, img in plots.items()},
             step=1000 * (epoch + 1),
         )
+    ut.restore_rng_state(rng_state)
     return stats, plots
 
 
@@ -536,7 +541,6 @@ def make_plots(
     mask_pred_fig = vis.plot_mask_pred(
         target=images,
         pred=state["pred_images"],
-        visible_mask=state["visible_mask"],
         pred_mask=state["pred_mask"],
         img_mask=img_mask,
         patch_size=args.patch_size,

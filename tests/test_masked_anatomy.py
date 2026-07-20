@@ -26,11 +26,11 @@ def _tiny_masked_anatomy(num_classes: int = 3) -> MaskedAnatomyViT:
         num_anatomy_classes=num_classes,
         img_size=16,
         patch_size=4,
-        depth=1,
-        embed_dim=24,
+        depth=0,
+        embed_dim=32,
         num_heads=4,
-        decoder_depth=1,
-        decoder_embed_dim=24,
+        decoder_depth=0,
+        decoder_embed_dim=32,
         decoder_num_heads=4,
     )
 
@@ -50,7 +50,7 @@ def test_masked_anatomy_forward_uses_class_head_and_fp32_loss():
             img_mask=img_mask,
             anatomy_counts=counts,
             mask_ratio=0.5,
-            masking_policy="per_sample_pad",
+            pad_to_multiple=8,
         )
 
     assert loss.dtype == torch.float32
@@ -60,10 +60,25 @@ def test_masked_anatomy_forward_uses_class_head_and_fp32_loss():
     assert state["pred_anatomy_labels"].shape == (2, 64)
     assert "pred_images" not in state
 
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        packed_loss = model(
+            images,
+            img_mask=img_mask,
+            anatomy_counts=counts,
+            mask_ratio=0.5,
+            pad_to_multiple=8,
+            with_state=False,
+        )
+    packed_loss.backward()
+
+    assert packed_loss.dtype == torch.float32
+    assert torch.isfinite(packed_loss)
+    assert model.decoder.head.weight.grad is not None
+
 
 def test_masked_anatomy_loss_ignores_padded_prediction_tokens():
     model = _tiny_masked_anatomy()
-    preds = torch.tensor(
+    dense_preds = torch.tensor(
         [
             [[3.0, 0.0, 0.0], [0.0, 100.0, 0.0]],
             [[0.0, 3.0, 0.0], [0.0, 0.0, 3.0]],
@@ -75,16 +90,20 @@ def test_masked_anatomy_loss_ignores_padded_prediction_tokens():
     counts[1, 6, 2] = 8
     pred_ids = torch.tensor([[4, 0], [5, 6]])
     pred_token_mask = torch.tensor([[True, False], [True, True]])
+    preds = dense_preds[pred_token_mask]
 
     loss = model.forward_anatomy_loss(
         preds,
         counts,
         pred_ids,
-        pred_token_mask=pred_token_mask,
+        pred_token_mask,
     )
     expected = (
-        -torch.log_softmax(preds[0, 0], dim=-1)[0]
-        + (-torch.log_softmax(preds[1, 0], dim=-1)[1] - torch.log_softmax(preds[1, 1], dim=-1)[2])
+        -torch.log_softmax(dense_preds[0, 0], dim=-1)[0]
+        + (
+            -torch.log_softmax(dense_preds[1, 0], dim=-1)[1]
+            - torch.log_softmax(dense_preds[1, 1], dim=-1)[2]
+        )
         / 2
     ) / 2
     assert torch.allclose(loss, expected)
