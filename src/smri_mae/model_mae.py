@@ -717,6 +717,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         pred_mask_ratio: float | None = None,
         pad_to_multiple: int | None = None,
         with_state: bool = True,
+        anatomy_counts: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, dict]:
         img_mask, visible_mask, pred_mask = self.prepare_masks(
             img_mask,
@@ -803,97 +804,53 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         return self.encoder.forward_embedding(x, mask=mask, mask_ratio=mask_ratio)
 
 
-class MaskedAnatomyViT(MaskedAutoencoderViT):
-    """MAE-style masked prediction of per-patch SynthSeg label distributions."""
-
-    def __init__(self, num_anatomy_classes: int, **kwargs):
-        if num_anatomy_classes <= 1:
-            raise ValueError(
-                f"num_anatomy_classes must be greater than 1, got {num_anatomy_classes}"
-            )
-
-        target_norm = kwargs.pop("target_norm", None)
-        if target_norm not in {None, "none"}:
-            raise ValueError("target_norm is only defined for image-reconstruction MAE")
-
-        super().__init__(target_norm=None, **kwargs)
-        self.num_anatomy_classes = int(num_anatomy_classes)
-        decoder_embed_dim = self.decoder.mask_token.shape[-1]
-        self.decoder.head = nn.Linear(decoder_embed_dim, self.num_anatomy_classes)
-        self.decoder.head.apply(_init_weights)
-
-    def extra_repr(self):
-        parent = super().extra_repr()
-        return f"{parent}, num_anatomy_classes={self.num_anatomy_classes}"
-
-    def validate_anatomy_counts(self, anatomy_counts: Tensor, batch_size: int) -> None:
-        expected = (
-            batch_size,
-            self.pred_patchify.num_patches,
-            self.num_anatomy_classes,
-        )
-        if anatomy_counts.ndim != 3 or tuple(anatomy_counts.shape) != expected:
-            raise ValueError(
-                "anatomy_counts must have shape "
-                f"(B, num_patches, num_anatomy_classes)={expected}, "
-                f"got {tuple(anatomy_counts.shape)}"
-            )
-        if anatomy_counts.is_floating_point() and not torch.isfinite(anatomy_counts).all():
-            raise ValueError("anatomy_counts contains non-finite values")
-        if (anatomy_counts < 0).any():
-            raise ValueError("anatomy_counts must be non-negative")
-
-    def forward_anatomy_loss(
+class JointMAEAnatomyViT(MaskedAutoencoderViT):
+    def __init__(
         self,
-        preds: Float[Tensor, "T C"],
-        anatomy_counts: Tensor,
-        pred_ids: Int[Tensor, "B Q"],
-        pred_token_mask: Tensor,
-    ) -> Tensor:
-        """Average labelled-voxel cross entropy per scan, then across scans."""
-        batch_ids, slot_ids = pred_token_mask.nonzero(as_tuple=True)
-        patch_ids = pred_ids[batch_ids, slot_ids]
-        target_counts = anatomy_counts[batch_ids, patch_ids].float()
-
-        log_probs = torch.log_softmax(preds.float(), dim=-1)
-        patch_nll = -(target_counts * log_probs).sum(dim=1)
-        patch_counts = target_counts.sum(dim=1)
-        batch_size = anatomy_counts.shape[0]
-        scan_nll = patch_nll.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_nll)
-        scan_counts = patch_counts.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_counts
+        num_anatomy_classes: int,
+        anatomy_loss_weight: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.num_anatomy_classes = num_anatomy_classes
+        self.anatomy_loss_weight = anatomy_loss_weight
+        self.anatomy_head = nn.Linear(
+            self.encoder.patch_embed.out_features,
+            num_anatomy_classes,
         )
-        if (scan_counts <= 0).any():
-            raise ValueError("each subject must have at least one labelled hidden-patch voxel")
-        return (scan_nll / scan_counts).mean()
+        self.anatomy_head.apply(_init_weights)
+
+    def _anatomy_loss(
+        self,
+        preds: Tensor,
+        anatomy_counts: Tensor,
+        token_ids: Tensor,
+        token_mask: Tensor,
+    ) -> Tensor:
+        batch_ids, slots = token_mask.nonzero(as_tuple=True)
+        patch_ids = token_ids[batch_ids, slots]
+        targets = anatomy_counts[batch_ids, patch_ids].float()
+        return -(targets * preds.float().log_softmax(dim=-1)).sum() / targets.sum().clamp_min(1)
 
     @torch.no_grad()
-    def forward_anatomy_labels(
+    def _anatomy_labels(
         self,
-        preds: Float[Tensor, "B Q C"],
+        preds: Tensor,
         anatomy_counts: Tensor,
-        pred_ids: Int[Tensor, "B Q"],
-        pred_token_mask: Tensor,
+        token_ids: Tensor,
+        token_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Return full-grid target labels and hidden-patch prediction labels."""
-        target_mass = anatomy_counts.sum(dim=-1)
-        target_labels = anatomy_counts.to(dtype=torch.int32).argmax(dim=-1)
-        target_labels = target_labels.masked_fill(target_mass <= 0, -1).to(dtype=torch.int16)
+        target_labels = anatomy_counts.argmax(dim=-1).to(torch.int16)
+        target_labels[anatomy_counts.sum(dim=-1) == 0] = -1
 
-        pred_values = (preds.argmax(dim=-1).to(dtype=torch.long) + 1) * pred_token_mask
-        full_pred_values = torch.zeros(
-            (preds.shape[0], self.pred_patchify.num_patches),
-            dtype=torch.long,
-            device=preds.device,
+        pred_labels = torch.full_like(target_labels, -1)
+        batch_ids, slots = token_mask.nonzero(as_tuple=True)
+        patch_ids = token_ids[batch_ids, slots]
+        foreground = anatomy_counts[batch_ids, patch_ids].sum(dim=-1) > 0
+        pred_labels[batch_ids[foreground], patch_ids[foreground]] = (
+            preds[batch_ids[foreground], slots[foreground]].argmax(dim=-1).to(torch.int16)
         )
-        full_pred_values.scatter_reduce_(
-            1,
-            pred_ids,
-            pred_values,
-            reduce="amax",
-            include_self=True,
-        )
-        return target_labels, (full_pred_values - 1).to(dtype=torch.int16)
+        return target_labels, pred_labels
 
     def forward(
         self,
@@ -904,19 +861,18 @@ class MaskedAnatomyViT(MaskedAutoencoderViT):
         pred_mask_ratio: float | None = None,
         pad_to_multiple: int | None = None,
         with_state: bool = True,
-    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
-        self.validate_anatomy_counts(anatomy_counts, images.shape[0])
-        anatomy_counts = anatomy_counts.to(device=images.device)
+    ) -> Tensor | tuple[Tensor, dict]:
+        anatomy_counts = anatomy_counts.to(images.device)
         img_mask, visible_mask, pred_mask = self.prepare_masks(
             img_mask,
             None,
             None,
             device=images.device,
         )
-
+        targets_patches, targets_stats = self.prepare_targets(images, img_mask)
         (
             cls_embeds,
-            reg_embeds,
+            _,
             patch_embeds,
             visible_mask,
             visible_ids,
@@ -933,7 +889,7 @@ class MaskedAnatomyViT(MaskedAutoencoderViT):
             pred_mask_ratio=pred_mask_ratio,
             pad_to_multiple=pad_to_multiple,
         )
-        preds = self.forward_decoder(
+        image_preds = self.forward_decoder(
             patch_embeds,
             visible_ids,
             pred_ids,
@@ -941,38 +897,49 @@ class MaskedAnatomyViT(MaskedAutoencoderViT):
             pred_token_mask=pred_token_mask,
             packed_output=not with_state,
         )
-        loss_preds = preds if not with_state else preds[pred_token_mask]
-        loss = self.forward_anatomy_loss(
-            loss_preds,
-            anatomy_counts,
+        anatomy_preds = self.anatomy_head(patch_embeds)
+        image_loss = MaskedAutoencoderViT.forward_loss(
+            self,
+            image_preds if not with_state else image_preds[pred_token_mask],
+            targets_patches,
+            pred_mask_patches,
             pred_ids,
             pred_token_mask,
         )
+        anatomy_loss = self._anatomy_loss(
+            anatomy_preds[visible_token_mask],
+            anatomy_counts,
+            visible_ids,
+            visible_token_mask,
+        )
+        loss = image_loss + self.anatomy_loss_weight * anatomy_loss
         if not with_state:
             return loss
 
-        target_anatomy_labels, pred_anatomy_labels = self.forward_anatomy_labels(
-            preds,
+        target_labels, pred_labels = self._anatomy_labels(
+            anatomy_preds,
             anatomy_counts,
-            pred_ids,
-            pred_token_mask,
+            visible_ids,
+            visible_token_mask,
         )
-        pred_mask = self.pred_patchify.unpatchify(pred_mask_patches)
-        state = {
-            "patch_embeds": patch_embeds,
+        pred_images = self.forward_pred_images(
+            image_preds,
+            pred_ids,
+            pred_token_mask=pred_token_mask,
+            img_mask=img_mask,
+            targets_stats=targets_stats,
+        )
+        return loss, {
             "cls_embeds": cls_embeds,
-            "reg_embeds": reg_embeds,
+            "patch_embeds": patch_embeds,
             "visible_mask": visible_mask,
-            "visible_ids": visible_ids,
-            "visible_token_mask": visible_token_mask,
-            "pred_mask": pred_mask,
-            "pred_ids": pred_ids,
-            "pred_token_mask": pred_token_mask,
-            "preds": preds,
-            "target_anatomy_labels": target_anatomy_labels,
-            "pred_anatomy_labels": pred_anatomy_labels,
+            "pred_mask": self.pred_patchify.unpatchify(pred_mask_patches),
+            "pred_images": pred_images,
+            "target_anatomy_labels": target_labels,
+            "pred_anatomy_labels": pred_labels,
+            "image_loss": image_loss,
+            "anatomy_loss": anatomy_loss,
         }
-        return loss, state
 
 
 class MaskedViT(MaskedEncoder, PyTorchModelHubMixin):
@@ -1061,14 +1028,6 @@ def _create_mae_vit(**kwargs):
     return model
 
 
-def _create_masked_anatomy_vit(**kwargs):
-    try:
-        num_anatomy_classes = kwargs.pop("num_anatomy_classes")
-    except KeyError as exc:
-        raise TypeError("num_anatomy_classes is required for masked anatomy models") from exc
-    return MaskedAnatomyViT(num_anatomy_classes=num_anatomy_classes, **kwargs)
-
-
 def mae_vit_small(**kwargs):
     model_args = dict(embed_dim=384, depth=12, num_heads=6)
     return _create_mae_vit(**model_args, **kwargs)
@@ -1089,24 +1048,12 @@ def mae_vit_huge(**kwargs):
     return _create_mae_vit(**model_args, **kwargs)
 
 
-def masked_anatomy_vit_small(**kwargs):
-    model_args = dict(embed_dim=384, depth=12, num_heads=6)
-    return _create_masked_anatomy_vit(**model_args, **kwargs)
+def joint_mae_anatomy_vit_base(**kwargs):
+    return JointMAEAnatomyViT(embed_dim=768, depth=12, num_heads=12, **kwargs)
 
 
-def masked_anatomy_vit_base(**kwargs):
-    model_args = dict(embed_dim=768, depth=12, num_heads=12)
-    return _create_masked_anatomy_vit(**model_args, **kwargs)
-
-
-def masked_anatomy_vit_large(**kwargs):
-    model_args = dict(embed_dim=1024, depth=24, num_heads=16)
-    return _create_masked_anatomy_vit(**model_args, **kwargs)
-
-
-def masked_anatomy_vit_huge(**kwargs):
-    model_args = dict(embed_dim=1280, depth=32, num_heads=16)
-    return _create_masked_anatomy_vit(**model_args, **kwargs)
+def joint_mae_anatomy_vit_large(**kwargs):
+    return JointMAEAnatomyViT(embed_dim=1024, depth=24, num_heads=16, **kwargs)
 
 
 # "patch embed" baseline model, depth 0 ViT (hah)

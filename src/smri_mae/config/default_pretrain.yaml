@@ -18,7 +18,6 @@ pred_mask_ratio: null
 pad_to_multiple: 32
 
 # Model.
-objective: mae
 model: mae_vit_large
 model_kwargs:
   # target normalization: null/none, global, slice, or patch.

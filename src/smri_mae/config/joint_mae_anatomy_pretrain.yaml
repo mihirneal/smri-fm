@@ -1,0 +1,20 @@
+name: joint-mae-anatomy
+notes: Joint masked MRI reconstruction and direct encoder SynthSeg anatomy prediction.
+
+model: joint_mae_anatomy_vit_base
+model_kwargs:
+  num_anatomy_classes: 98
+  # Pilot value; calibrate once from encoder-gradient magnitudes, then freeze.
+  anatomy_loss_weight: 0.1
+
+datasets:
+  fomo_train:
+    url: datasets/FOMO_anat/train/shard.*.tar
+    subject_index: datasets/FOMO_anat/train.subject-index.json
+    sampling: subject
+    read_ahead: 2048
+    include_anat: true
+
+  fomo_val:
+    url: datasets/FOMO_anat/val/shard.*.tar
+    include_anat: true
