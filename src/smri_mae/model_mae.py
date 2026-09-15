@@ -671,7 +671,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         targets = targets_patches[batch_ids, patch_ids]
         voxel_mask = pred_mask_patches[batch_ids, patch_ids]
 
-        patch_errors = ((preds - targets) ** 2 * voxel_mask).sum(dim=1)
+        patch_errors = ((preds.float() - targets.float()) ** 2 * voxel_mask).sum(dim=1)
         patch_voxels = voxel_mask.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
         scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
@@ -713,6 +713,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         pred_mask_ratio: float | None = None,
         pad_to_multiple: int | None = None,
         with_state: bool = True,
+        target_images: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, dict]:
         img_mask, visible_mask, pred_mask = self.prepare_masks(
             img_mask,
@@ -720,7 +721,9 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             None,
             device=images.device,
         )
-        targets_patches, targets_stats = self.prepare_targets(images, img_mask)
+        if target_images is None:
+            target_images = images
+        targets_patches, targets_stats = self.prepare_targets(target_images, img_mask)
 
         (
             cls_embeds,

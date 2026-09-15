@@ -58,6 +58,17 @@ num_workers: 4
 prefetch_factor: 2
 presend_cuda: true
 
+resolution_augmentation:
+  enabled: false
+  identity_probability: 0.5
+  isotropic_probability: 0.25
+  isotropic_factors: [1.25, 1.5, 1.75, 2.0]
+  anisotropic_factors: [2.0, 3.0, 4.0]
+  anisotropic_axis_probabilities: [0.1, 0.1, 0.8]  # L–R, A–P, S–I
+  chunk_size: 4
+
+resolution_preview: null
+
 # Optimization.
 epochs: 100
 batch_size: 64

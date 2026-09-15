@@ -12,6 +12,7 @@ import math
 import random
 import subprocess
 import time
+from collections import Counter
 from contextlib import nullcontext
 from functools import partial
 from itertools import islice
@@ -32,6 +33,7 @@ import smri_mae.mri_data as mri_data
 import smri_mae.model_mae as models_mae
 import smri_mae.utils as ut
 import smri_mae.visualization as vis
+from smri_mae.augmentation import apply_resolution_augmentation, sample_resolution_plan
 
 DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
 
@@ -144,6 +146,11 @@ def main(args: DictConfig):
     # load checkpoint/resume training
     ut.load_model(args, model_without_ddp, optimizer, loss_scaler)
 
+    resolution_examples = []
+    augmentation_history = []
+    if is_master and args.wandb and args.get("resolution_preview"):
+        resolution_examples = vis.load_resolution_examples(args.resolution_preview.examples)
+
     print(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
     for epoch in range(args.start_epoch, args.epochs):
@@ -157,6 +164,9 @@ def main(args: DictConfig):
             epoch,
             device,
         )
+        if is_master and args.wandb and args.resolution_augmentation.enabled:
+            augmentation_history.append({"epoch": epoch + 1, **train_stats})
+            wandb.log(vis.plot_augmentation_counts(augmentation_history), step=1000 * (epoch + 1))
         eval_stats = {}
         eval_plots = {}
         eval_period = args.get("eval_period", 1)
@@ -174,6 +184,15 @@ def main(args: DictConfig):
                 eval_plots.update(plots)
 
         merged_stats = {"epoch": epoch, **train_stats, **eval_stats}
+        if resolution_examples:
+            plots = vis.reconstruction_panels(
+                args, model_without_ddp, resolution_examples, device,
+            )
+            wandb.log(
+                {name: wandb.Image(image) for name, image in plots.items()},
+                step=1000 * (epoch + 1),
+            )
+            eval_plots.update(plots)
         if is_master:
             with (output_dir / "log.json").open("a") as f:
                 print(json.dumps(merged_stats), file=f)
@@ -208,19 +227,20 @@ def create_data_loaders(args: DictConfig):
             dataset_config["url"],
             shuffle=shuffle,
             buffer_size=dataset_config["buffer_size"],
+            key_manifest=dataset_config.get("key_manifest"),
+            acquisition_policy=dataset_config.get("acquisition_policy"),
         )
-        num_workers = int(args.num_workers)
-        loader_kwargs = {
-            "batch_size": args.batch_size,
-            "collate_fn": partial(mri_data.collate, include_meta=not is_train),
-            "shuffle": False,
-            "num_workers": num_workers,
-            "persistent_workers": num_workers > 0,
-            "pin_memory": True,
-            "drop_last": drop_last,
-            "prefetch_factor": args.prefetch_factor,
-        }
-        loader = wds.WebLoader(dataset, **loader_kwargs)
+        loader = wds.WebLoader(
+            dataset,
+            batch_size=args.batch_size,
+            collate_fn=partial(mri_data.collate, include_meta=not is_train),
+            shuffle=False,
+            num_workers=args.num_workers,
+            persistent_workers=True,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=True,
+            drop_last=drop_last,
+        )
         num_batches = samples_per_epoch // (ut.get_world_size() * args.batch_size)
         loader = loader.with_epoch(num_batches)
         loader = loader.with_length(num_batches, silent=True)
@@ -229,6 +249,40 @@ def create_data_loaders(args: DictConfig):
 
     train_loader = data_loaders.pop(args.train_dataset)
     return train_loader, data_loaders
+
+
+def prepare_training_images(batch, args, generator, augmentation_counts=None):
+    reference, img_mask = mri_data.densify_sparse_image_batch(
+        batch["image_values"],
+        batch["img_mask"],
+        (int(args.get("in_chans", 1)), *args.img_size),
+    )
+    config = args.get("resolution_augmentation")
+    if config is not None and config.enabled:
+        factors = sample_resolution_plan(
+            reference.shape[0],
+            generator,
+            identity_probability=config.identity_probability,
+            isotropic_probability=config.isotropic_probability,
+            isotropic_factors=tuple(config.isotropic_factors),
+            anisotropic_factors=tuple(config.anisotropic_factors),
+            anisotropic_axis_probabilities=tuple(config.anisotropic_axis_probabilities),
+        )
+        max_factors = torch.tensor(batch["resolution_max_factors"], dtype=torch.float64)
+        blocked = ~(factors <= max_factors).all(dim=1)
+        factors[blocked] = 1
+        if augmentation_counts is not None:
+            augmentation_counts.update(tuple(row) for row in factors.tolist())
+        images = apply_resolution_augmentation(
+            reference,
+            img_mask,
+            factors,
+            output_dtype=reference.dtype,
+            chunk_size=config.chunk_size,
+        )
+    else:
+        images = reference
+    return images, img_mask, reference
 
 
 def sync_checkpoints_to_r2(args: DictConfig, output_dir: Path) -> None:
@@ -258,6 +312,7 @@ def train_one_epoch(
     metric_logger.add_meter("grad", ut.SmoothedValue())
     header = f"Train: [{epoch}]"
     log_wandb = args.wandb and ut.is_main_process()
+    augmentation_counts = Counter()
 
     epoch_num_batches = len(data_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
@@ -265,11 +320,12 @@ def train_one_epoch(
     print_freq = args.get("print_freq", 100) if not args.debug else 1
     num_batches = epoch_num_batches if not args.debug else 10
     amp_dtype = getattr(torch, args.amp_dtype)
+    augmentation_generator = torch.Generator(device="cpu").manual_seed(
+        int(args.seed) + 2_000_003 + 1_000_003 * ut.get_rank() + 1_000_000_007 * epoch
+    )
     use_cuda = device.type == "cuda"
     if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(
-            data_loader, device, dtype_map={torch.float16: amp_dtype}
-        )
+        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device)
 
     optimizer.zero_grad()
 
@@ -277,7 +333,7 @@ def train_one_epoch(
         metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
     ):
         if use_cuda and not args.presend_cuda:
-            batch = ut.send_data(batch, device, dtype_map={torch.float16: amp_dtype})
+            batch = ut.send_data(batch, device)
 
         batch_step = batch_idx + 1
         log_step = batch_step % print_freq == 0 or batch_step == num_batches
@@ -289,11 +345,8 @@ def train_one_epoch(
         if need_update:
             ut.update_lr(optimizer.param_groups, lr)
 
-        images, img_mask = mri_data.densify_sparse_image_batch(
-            batch["image_values"],
-            batch["img_mask"],
-            (int(args.get("in_chans", 1)), *args.img_size),
-            dtype=amp_dtype,
+        images, img_mask, reference = prepare_training_images(
+            batch, args, augmentation_generator, augmentation_counts,
         )
 
         sync_context = model.no_sync() if args.distributed and not need_update else nullcontext()
@@ -306,6 +359,7 @@ def train_one_epoch(
                     pred_mask_ratio=args.pred_mask_ratio,
                     pad_to_multiple=args.pad_to_multiple,
                     with_state=False,
+                    target_images=reference,
                 )
 
             loss_for_log = loss.detach()
@@ -336,7 +390,12 @@ def train_one_epoch(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {f"train/{k}": meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats = {f"train/{k}": meter.global_avg for k, meter in metric_logger.meters.items()}
+    config = args.get("resolution_augmentation")
+    if config is not None and config.enabled:
+        augmentation_stats = vis.augmentation_metrics(augmentation_counts, config, device)
+        stats.update(augmentation_stats)
+    return stats
 
 
 @torch.inference_mode()
@@ -371,25 +430,23 @@ def evaluate(
     if use_cuda:
         torch.cuda.manual_seed(eval_seed)
     if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(
-            data_loader, device, dtype_map={torch.float16: amp_dtype}
-        )
+        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device)
 
     eval_batches = islice(data_loader, num_batches)
     for batch_idx, batch in enumerate(
         metric_logger.log_every(eval_batches, print_freq, header, total_steps=num_batches)
     ):
         if use_cuda and not args.presend_cuda:
-            batch = ut.send_data(batch, device, dtype_map={torch.float16: amp_dtype})
+            batch = ut.send_data(batch, device)
 
         batch_step = batch_idx + 1
 
-        images, img_mask = mri_data.densify_sparse_image_batch(
+        reference, img_mask = mri_data.densify_sparse_image_batch(
             batch["image_values"],
             batch["img_mask"],
             (int(args.get("in_chans", 1)), *args.img_size),
-            dtype=amp_dtype,
         )
+        images = reference
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss, state = model(
@@ -398,6 +455,7 @@ def evaluate(
                 mask_ratio=args.mask_ratio,
                 pred_mask_ratio=args.pred_mask_ratio,
                 pad_to_multiple=args.pad_to_multiple,
+                target_images=reference,
             )
 
         loss_value = loss.detach().float().item()
@@ -409,7 +467,7 @@ def evaluate(
         metric_logger.meters["loss"].update(loss_value, n=int(batch["img_mask"].shape[0]))
 
         if is_master and batch_step == example_step:
-            example_batch = {"image": images[:1], "img_mask": img_mask[:1]}
+            example_batch = {"image": reference[:1], "img_mask": img_mask[:1]}
             if "meta" in batch:
                 example_batch["meta"] = batch["meta"][:1]
             example_state = {

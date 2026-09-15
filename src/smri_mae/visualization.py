@@ -1,12 +1,18 @@
 from collections.abc import Mapping
 from io import BytesIO
+import tarfile
 
+import numpy as np
 import torch
+import wandb
 
 from matplotlib import patches
 from matplotlib import pyplot as plt
 from PIL import Image
 from torch import Tensor
+
+from smri_mae import mri_data
+from smri_mae.augmentation import apply_resolution_augmentation
 
 VIEW_NAMES = {
     "sagittal": "Sagittal",
@@ -398,3 +404,130 @@ def _patch_rectangles(
             if mask[row : row + box_h, col : col + box_w].any():
                 rectangles.append((col, row, box_w, box_h))
     return rectangles
+
+
+def load_resolution_examples(examples):
+    samples = []
+    for example in examples:
+        with tarfile.open(example.shard) as shard:
+            sample = {
+                field: np.load(BytesIO(shard.extractfile(f"{example.key}.{field}.npy").read()))
+                for field in ("image_values", "img_mask")
+            }
+        samples.append(sample)
+    return samples
+
+
+def augmentation_metrics(counts, config, device):
+    factors = sorted(set(config.isotropic_factors) | set(config.anisotropic_factors))
+    names = ["isotropic_scans", "anisotropic_scans"] + [f"factor_{factor:g}_scans" for factor in factors]
+    totals = dict.fromkeys(names, 0)
+    for plan, count in counts.items():
+        factor = max(plan)
+        if factor == 1:
+            continue
+        kind = "isotropic" if len(set(plan)) == 1 else "anisotropic"
+        totals[f"{kind}_scans"] += count
+        totals[f"factor_{factor:g}_scans"] += count
+    values = torch.tensor(list(totals.values()), device=device)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(values)
+    return {f"augmentation/{name}": value for name, value in zip(names, values.cpu().tolist())}
+
+
+def plot_augmentation_counts(history):
+    epochs = [row["epoch"] for row in history]
+    type_keys = ["augmentation/isotropic_scans", "augmentation/anisotropic_scans"]
+    factor_keys = [key for key in history[-1] if key.startswith("augmentation/factor_")]
+    return {
+        "augmentation/type_counts": wandb.plot.line_series(
+            epochs, [[row[key] for row in history] for key in type_keys],
+            keys=["Isotropic", "Anisotropic"], title="Augmented scans per epoch", xname="Epoch",
+        ),
+        "augmentation/downsample_counts": wandb.plot.line_series(
+            epochs, [[row[key] for row in history] for key in factor_keys],
+            keys=[key.removeprefix("augmentation/factor_").removesuffix("_scans") + "×" for key in factor_keys],
+            title="Scans per downsampling factor", xname="Epoch",
+        ),
+    }
+
+
+@torch.inference_mode()
+def reconstruction_panels(args, model, samples, device):
+    config = args.resolution_preview
+    was_training = model.training
+    model.eval()
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    plots = {}
+    try:
+        with torch.random.fork_rng(devices=devices):
+            for example, sample in zip(config.examples, samples):
+                example_panels = []
+                batch = mri_data.collate([sample], include_meta=False)
+                reference, mask = mri_data.densify_sparse_image_batch(
+                    batch["image_values"].to(device), batch["img_mask"].to(device),
+                    (int(args.get("in_chans", 1)), *args.img_size),
+                )
+                for variant in config.variants:
+                    torch.random.default_generator.manual_seed(args.eval_seed)
+                    if device.type == "cuda":
+                        torch.cuda.manual_seed(args.eval_seed)
+                    augmented = apply_resolution_augmentation(
+                        reference, mask, torch.tensor([list(variant.factors)], dtype=torch.float64),
+                        output_dtype=reference.dtype, chunk_size=1,
+                    )
+                    with torch.autocast(device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
+                        _, state = model(
+                            augmented, img_mask=mask, target_images=reference,
+                            mask_ratio=args.mask_ratio, pred_mask_ratio=None,
+                            pad_to_multiple=args.pad_to_multiple,
+                        )
+                    title = f"{example.name} · {variant.name} · XYZ factors {list(variant.factors)}"
+                    panel = plot_reconstruction(
+                        reference, augmented, mask, state, config.slice_indices, title,
+                    )
+                    example_panels.append(panel)
+                combined = Image.new(
+                    "RGB", (max(panel.width for panel in example_panels), sum(panel.height for panel in example_panels)),
+                    color="#0f1720",
+                )
+                top = 0
+                for panel in example_panels:
+                    combined.paste(panel, (0, top))
+                    top += panel.height
+                plots[f"eval/resolution/{example.name}"] = combined
+    finally:
+        model.train(was_training)
+    return plots
+
+
+def plot_reconstruction(reference, augmented, mask, state, slice_indices, title):
+    rows = []
+    for axis, index in enumerate(slice_indices):
+        target = reference[0, 0].select(axis, index).float().cpu().T.flip(0)
+        image = augmented[0, 0].select(axis, index).float().cpu().T.flip(0)
+        brain = mask[0, 0].select(axis, index).cpu().T.flip(0)
+        visible = state["visible_mask"][0, 0].select(axis, index).cpu().T.flip(0)
+        predicted = state["pred_mask"][0, 0].select(axis, index).cpu().T.flip(0)
+        prediction = state["pred_images"][0, 0].select(axis, index).float().cpu().T.flip(0)
+        reconstruction = torch.where(predicted, prediction, image)
+        rows.append((target, image, reconstruction, brain, visible))
+    vmin, vmax = torch.quantile(torch.cat([row[0][row[3]] for row in rows]), torch.tensor([.005, .995])).tolist()
+    fig, axes = plt.subplots(3, 4, figsize=(12, 9), facecolor="#0f1720", layout="constrained")
+    for row, view, row_axes in zip(rows, ("Sagittal", "Coronal", "Axial"), axes):
+        target, image, reconstruction, brain, visible = row
+        panels = (target, image, image.masked_fill(~visible, vmin), reconstruction)
+        for ax, panel in zip(row_axes, panels):
+            ax.imshow(panel.masked_fill(~brain, vmin), cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+        row_axes[0].set_ylabel(view, color="white")
+    for ax, label in zip(axes[0], ("Original target", "Augmented input", "Masked input", "Reconstruction*")):
+        ax.set_title(label, color="white", fontsize=11)
+    fig.suptitle(title, color="white", fontsize=13)
+    fig.supxlabel("*Predictions in hidden regions + visible augmented input. Fixed scans, slices, factors and mask.", color="white", fontsize=9)
+    image = fig2pil(fig)
+    plt.close(fig)
+    return image

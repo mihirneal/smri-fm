@@ -1,4 +1,7 @@
+import json
 import math
+from functools import partial
+from pathlib import Path
 from glob import glob
 from typing import Sequence
 
@@ -23,6 +26,8 @@ def collate(
 
     if include_meta:
         batch["meta"] = [sample["meta"] for sample in samples]
+    if "resolution_max_factors" in samples[0]:
+        batch["resolution_max_factors"] = [sample["resolution_max_factors"] for sample in samples]
     return batch
 
 
@@ -95,12 +100,16 @@ def warn_and_continue(exn):
     return True
 
 
-def extract_sparse_wds_sample(sample: dict) -> dict:
-    return {
+def extract_sparse_wds_sample(sample: dict, *, resolution_eligible_keys: set[str] | None = None) -> dict:
+    result = {
         "image_values": np.asarray(sample["image_values.npy"], dtype=np.float16),
         "img_mask": np.asarray(sample["img_mask.npy"], dtype=np.uint8),
         "meta": sample["meta.json"],
     }
+    if resolution_eligible_keys is not None:
+        factor = 4.0 if sample["__key__"] in resolution_eligible_keys else 1.0
+        result["resolution_max_factors"] = [factor, factor, factor]
+    return result
 
 
 def make_sparse_wds_dataset(
@@ -108,6 +117,8 @@ def make_sparse_wds_dataset(
     *,
     shuffle: bool,
     buffer_size: int,
+    key_manifest: str | Path | None = None,
+    acquisition_policy: str | Path | None = None,
 ) -> wds.WebDataset:
     dataset = wds.WebDataset(
         expand_urls(url),
@@ -116,7 +127,18 @@ def make_sparse_wds_dataset(
         shardshuffle=False,
         nodesplitter=wds.split_by_node,
     )
-    dataset = dataset.decode().map(extract_sparse_wds_sample, handler=warn_and_continue)
+    if key_manifest is not None:
+        with Path(key_manifest).open() as stream:
+            selected_keys = {json.loads(line)["key"] for line in stream}
+        dataset = dataset.select(lambda sample: sample["__key__"] in selected_keys)
+    resolution_eligible_keys = None
+    if acquisition_policy is not None:
+        with Path(acquisition_policy).open() as stream:
+            resolution_eligible_keys = set(json.load(stream)["eligible_keys"])
+    dataset = dataset.decode().map(
+        partial(extract_sparse_wds_sample, resolution_eligible_keys=resolution_eligible_keys),
+        handler=warn_and_continue,
+    )
     if shuffle:
         dataset = dataset.shuffle(buffer_size)
     return dataset
