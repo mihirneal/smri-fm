@@ -3,47 +3,66 @@ requires = ["setuptools>=64", "setuptools_scm[toml]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "smri-fm"
+name = "walnut-fomo26"
 dynamic = ["version"]
-description = "MedARC sMRI foundation model"
+description = "MedARC FOMO 2026 walnut submission"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11"
 dependencies = [
-    "braceexpand",
-    "datasets",
     "einops",
     "huggingface-hub",
-    "ipython",
     "jaxtyping",
-    "jupyter",
-    "matplotlib",
     "nibabel",
     "numpy",
+    "timm",
+    "torch>=2.8",
+]
+
+[dependency-groups]
+pretrain = [
+    "braceexpand",
+    "matplotlib",
     "omegaconf",
     "pandas",
-    "pre-commit",
-    "pytest",
-    "pyyaml",
-    "s3fs",
-    "scikit-learn==1.8.0",
-    "scipy",
-    "seaborn",
-    "SynthSeg",
-    "tabulate",
-    "templateflow",
-    "timm",
-    "torch==2.8.0",
-    "torchvision",
+    "pillow",
     "tqdm",
     "wandb",
     "webdataset",
 ]
+tune = [
+    "datasets",
+    "fsspec",
+    "joblib",
+    "omegaconf",
+    "pandas",
+    # unpickles the submitted heads
+    "scikit-learn==1.8.0",
+    "scipy",
+    "SynthSeg",
+    # the training env and the submission container
+    "torch==2.8.0",
+    "tqdm",
+]
+dev = [
+    "ipython",
+    "jupyter",
+    "pre-commit",
+    "pytest",
+    "pyyaml",
+    "s3fs",
+    "seaborn",
+    "tabulate",
+    "templateflow",
+]
 
+[tool.uv]
+default-groups = "all"
 
 [tool.uv.sources]
 SynthSeg = { git = "https://github.com/MedARC-AI/SynthSeg.git", rev = "2690d9ac9ae28323d03043406cd21db0a8741547" }
 
 [tool.setuptools_scm]
+fallback_version = "0.1.0"
 version_file = "src/_version.py"
 
 [tool.setuptools.package-data]
